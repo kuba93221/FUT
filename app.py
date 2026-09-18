@@ -166,6 +166,17 @@ def health_check():
         return "FUTURES_ENGINE_STANDBY", 503
     return "FUTURES_ENGINE_ONLINE_3X_SANDBOX", 200
 
+@app.route('/run-analysis', methods=['GET', 'POST'])
+def manual_analysis_trigger():
+    """Endpoint dla zewnętrznych budzików (CronJob/UptimeRobot)."""
+    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
+        return jsonify({"status": "error", "message": "Pętla bota nie jest aktywna."}), 503
+    return jsonify({
+        "status": "success",
+        "message": "Silnik Futures 3x działa w pełni autonomicznie w tle.",
+        "engine": "ONLINE_3X_SANDBOX"
+    }), 200
+
 # =========================================================================
 # REGULATOR PRZEPŁYWU SIECIOWEGO (TOKEN BUCKET RATE LIMITER)
 # =========================================================================
@@ -495,7 +506,7 @@ class BreakoutQuantCore:
         }
 
 class PullbackQuantCore:
-    """Nowa strategia zastępująca Grid: kupno lub krótka sprzedaż na retestach EMA-20 w trendzie."""
+    """Strategia Trend Pullback: wejścia na retestach EMA-20 w trendzie."""
     @staticmethod
     def calculate_pullback(candles: List[List[str]]) -> Optional[Dict[str, Any]]:
         if len(candles) < 55:
@@ -570,18 +581,14 @@ class MarketRegimeArbitrator:
         return "NEUTRAL"
 
 # =========================================================================
-# KLIENT ASYNCHRONICZNY WEBSOCKET DLA FUTURES SANDBOX (Z WATCHDOGIEM 45S)
+# KLIENT ASYNCHRONICZNY WEBSOCKET DLA EUROPEJSKIEGO KLASTRA EEA
 # =========================================================================
 class OKXWebSocketPriceFeed:
     def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = True):
         self.session = session
         self.is_sandbox = is_sandbox
-        # [AKTUALIZACJA EEA]: Oficjalne serwery WebSocket OKX dla strefy europejskiej
-        self.ws_url = (
-            "wss://wseeapap.okx.com:8443/ws/v5/public" 
-            if is_sandbox 
-            else "wss://wseea.okx.com:8443/ws/v5/public"
-        )
+        # Oficjalne serwery WebSocket dla kont zarejestrowanych w Europie (EEA)
+        self.ws_url = "wss://wseeapap.okx.com:8443/ws/v5/public" if is_sandbox else "wss://wseea.okx.com:8443/ws/v5/public"
         self.latest_prices: Dict[str, float] = {}
         self.last_msg_time = time.monotonic()
         self._running: bool = False
@@ -594,7 +601,7 @@ class OKXWebSocketPriceFeed:
         while self._running and not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
             try:
                 mode_str = "SANDBOX" if self.is_sandbox else "LIVE"
-                logger.info(f"🌐 [WS-CONNECT] Łączenie z WebSocket OKX SWAP ({mode_str}): {self.ws_url}...")
+                logger.info(f"🌐 [WS-CONNECT] Łączenie z WebSocket OKX SWAP EEA ({mode_str}): {self.ws_url}...")
                 async with self.session.ws_connect(self.ws_url, heartbeat=20) as ws:
                     await ws.send_str(subscribe_msg)
                     logger.info(f"📡 [WS-SUBSCRIBED] Subskrypcja SWAP aktywna dla {symbols}")
@@ -792,7 +799,7 @@ class OKXFuturesClient:
         contract_nominal_usdc = ct_val * current_price
         single_contract_margin = contract_nominal_usdc / self.TARGET_LEVERAGE
 
-        # TWARDY BEZPIECZNIK ADWOKATA DIABŁA: Blokada jeśli 1 min-kontrakt przekracza dopuszczalny limit
+        # Twardy bezpiecznik: Blokada jeśli 1 min-kontrakt przekracza dopuszczalny limit
         if (min_sz * single_contract_margin) > max_allowed_margin:
             logger.warning(f"🛡️ [SIZING-REJECTED] {symbol}: 1 lot wymaga {round(min_sz * single_contract_margin, 2)} USDC > limit {round(max_allowed_margin, 2)} USDC.")
             return 0, 0.0
