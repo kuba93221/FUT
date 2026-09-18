@@ -785,36 +785,40 @@ class OKXFuturesClient:
             return None
 
     async def set_leverage(self, symbol: str, leverage: int = 3, pos_side: str = "long") -> bool:
-        """Wymusza dźwignię 3x i margines izolowany z automatycznym fallbackiem."""
-        await self.rate_limiter.consume()
-        request_path = "/api/v5/account/set-leverage"
-        
-        # Próba 1: z posSide
-        body_dict = {"instId": symbol, "lever": str(leverage), "mgnMode": self.MARGIN_MODE, "posSide": pos_side}
-        body = json.dumps(body_dict)
-        url = f"{self.base_url}{request_path}"
-        headers = self._get_headers("POST", request_path, body)
-        try:
-            async with self.session.post(url, data=body, headers=headers, timeout=5) as resp:
-                data = await resp.json()
-                code = data.get("code")
-                if code == "0" or code == "51000" or "not modified" in data.get("msg", "").lower():
-                    return True
-                
-                # Próba 2 (Fallback): bez posSide dla pewności
-                body_dict_fb = {"instId": symbol, "lever": str(leverage), "mgnMode": self.MARGIN_MODE}
-                body_fb = json.dumps(body_dict_fb)
-                headers_fb = self._get_headers("POST", request_path, body_fb)
-                async with self.session.post(url, data=body_fb, headers=headers_fb, timeout=5) as resp_fb:
-                    data_fb = await resp_fb.json()
-                    code_fb = data_fb.get("code")
-                    if code_fb == "0" or code_fb == "51000" or "not modified" in data_fb.get("msg", "").lower():
+        """Wymusza dźwignię 3x z obsługą kodu 50011 (Too Many Requests) i automatycznym ponawianiem."""
+        for attempt in range(3):
+            await self.rate_limiter.consume()
+            request_path = "/api/v5/account/set-leverage"
+            body_dict = {"instId": symbol, "lever": str(leverage), "mgnMode": self.MARGIN_MODE, "posSide": pos_side}
+            body = json.dumps(body_dict)
+            url = f"{self.base_url}{request_path}"
+            headers = self._get_headers("POST", request_path, body)
+            try:
+                async with self.session.post(url, data=body, headers=headers, timeout=5) as resp:
+                    data = await resp.json()
+                    code = data.get("code")
+                    if code == "0" or code == "51000" or "not modified" in data.get("msg", "").lower():
                         return True
-                    logger.error(f"❌ [FUTURES-LEVERAGE-ERROR] {symbol} [{pos_side}]: {data_fb.get('msg')} (kod: {code_fb})")
-                    return False
-        except Exception as e:
-            logger.error(f"[FUTURES-LEVERAGE] Błąd lewaru {symbol} [{pos_side}]: {e}")
-            return False
+                    if code == "50011":
+                        logger.warning(f"⚠️ [RATE-LIMIT-50011] Zbyt wiele zapytań dla {symbol} [{pos_side}]. Ponowienie za {1.5 * (attempt + 1)}s...")
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    
+                    # Fallback bez posSide
+                    body_dict_fb = {"instId": symbol, "lever": str(leverage), "mgnMode": self.MARGIN_MODE}
+                    body_fb = json.dumps(body_dict_fb)
+                    headers_fb = self._get_headers("POST", request_path, body_fb)
+                    async with self.session.post(url, data=body_fb, headers=headers_fb, timeout=5) as resp_fb:
+                        data_fb = await resp_fb.json()
+                        code_fb = data_fb.get("code")
+                        if code_fb == "0" or code_fb == "51000" or "not modified" in data_fb.get("msg", "").lower():
+                            return True
+                        logger.error(f"❌ [FUTURES-LEVERAGE-ERROR] {symbol} [{pos_side}]: {data_fb.get('msg')} (kod: {code_fb})")
+                        return False
+            except Exception as e:
+                logger.error(f"[FUTURES-LEVERAGE] Błąd lewaru {symbol} [{pos_side}]: {e}")
+                await asyncio.sleep(1.0)
+        return False
 
     async def get_wallet_balances(self, preferred_ccy: str = "USDT") -> Dict[str, Any]:
         """Pobiera kapitał i wolny depozyt, obsługując automatycznie USDT oraz USDC."""
@@ -1655,13 +1659,16 @@ async def continuous_async_cron(loop):
         ws_feed = OKXWebSocketPriceFeed(session, is_sandbox=IS_SANDBOX)
         GLOBAL_WS_FEED = ws_feed
 
-        # 1. Konfiguracja konta SWAP przy starcie
+        # 1. Konfiguracja konta SWAP przy starcie z opóźnieniami rate-limit
         await okx_client.set_position_mode("long_short_mode")
         symbols_to_stream = [item["symbol"] for item in FUTURES_INSTRUMENTS]
         for sym in symbols_to_stream:
             spec = await okx_client.load_instrument_specification(sym)
+            await asyncio.sleep(0.4)
             lev_l = await okx_client.set_leverage(sym, TARGET_LEVERAGE, "long")
+            await asyncio.sleep(0.4)
             lev_s = await okx_client.set_leverage(sym, TARGET_LEVERAGE, "short")
+            await asyncio.sleep(0.4)
             if spec:
                 logger.info(f"🛡️ [LEVERAGE-STATUS] {sym} | Dźwignia 3x [LONG: {lev_l}, SHORT: {lev_s}]")
 
@@ -1729,9 +1736,13 @@ def web_test_futures_environment():
             for item in FUTURES_INSTRUMENTS:
                 sym = item["symbol"]
                 spec = await client.load_instrument_specification(sym)
+                await asyncio.sleep(0.3)
                 ticker = await client.get_market_ticker(sym)
+                await asyncio.sleep(0.3)
                 lev_l = await client.set_leverage(sym, TARGET_LEVERAGE, "long")
+                await asyncio.sleep(0.3)
                 lev_s = await client.set_leverage(sym, TARGET_LEVERAGE, "short")
+                await asyncio.sleep(0.3)
                 instruments_report.append({
                     "symbol": sym,
                     "spec_loaded": spec is not None,
@@ -1759,7 +1770,7 @@ def web_test_futures_environment():
 
     fut = asyncio.run_coroutine_threadsafe(_run_diag(), BACKGROUND_LOOP)
     try:
-        res = fut.result(timeout=15)
+        res = fut.result(timeout=25)
         return jsonify({"status": "success", "diagnostics": res}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
