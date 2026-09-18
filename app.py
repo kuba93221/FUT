@@ -42,10 +42,16 @@ _stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(
 logger.addHandler(_stream_handler)
 logger.propagate = False
 
-print("🚀 [BOOT] Silnik Futures 3x (Sandbox) inicjalizuje telemetrie na Renderze...", flush=True)
+print("🚀 [BOOT] Silnik Futures 3x (USDC/Sandbox) inicjalizuje telemetrie na Renderze...", flush=True)
 
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
-logger.info(f"⚙️ [SYSTEM-INIT] Silnik Futures 3x Online [ATOMOWY LOCK | DUAL TIME-STOP | LEWAR: 3x IZOLOWANY | SANDBOX: {IS_SANDBOX}]")
+
+# Waluta kwotowana kontraktów perpetual SWAP na OKX (domyślnie USDC zgodnie z wytycznymi produkcyjnymi)
+QUOTE_CCY = os.environ.get("QUOTE_CCY", "USDC").strip().upper()
+TARGET_LEVERAGE = 3
+TARGET_MARGIN_MODE = "isolated"
+
+logger.info(f"⚙️ [SYSTEM-INIT] Silnik Futures 3x Online [QUOTE: {QUOTE_CCY} | ATOMOWY LOCK | DUAL TIME-STOP | LEWAR: 3x IZOLOWANY | SANDBOX: {IS_SANDBOX}]")
 
 BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
 GLOBAL_ALPHA_LOCK: Optional[asyncio.Lock] = None
@@ -53,12 +59,7 @@ ASYNC_SHUTDOWN_EVENT: Optional[asyncio.Event] = None
 RATE_LIMITER: Optional[Any] = None
 GLOBAL_WS_FEED: Optional[Any] = None
 
-# Waluta kwotowana kontraktów perpetual SWAP na OKX (oficjalnie USDT dla rynku liniowego SWAP w Europie)
-QUOTE_CCY = os.environ.get("QUOTE_CCY", "USDT").strip().upper()
-TARGET_LEVERAGE = 3
-TARGET_MARGIN_MODE = "isolated"
-
-# Oficjalne instrumenty SWAP na OKX: BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP, XRP-USDT-SWAP
+# Oficjalne instrumenty SWAP na OKX rozliczane w QUOTE_CCY (np. USDC-Margined)
 FUTURES_INSTRUMENTS = [
     {"symbol": f"BTC-{QUOTE_CCY}-SWAP", "base": "BTC", "label": f"BTC_{QUOTE_CCY}", "price_round": 2},
     {"symbol": f"ETH-{QUOTE_CCY}-SWAP", "base": "ETH", "label": f"ETH_{QUOTE_CCY}", "price_round": 2},
@@ -167,7 +168,7 @@ def health_check():
     """Główny ping sprawdzający stan życia usługi."""
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
         return "FUTURES_ENGINE_STANDBY", 503
-    return "FUTURES_ENGINE_ONLINE_3X_SANDBOX", 200
+    return f"FUTURES_ENGINE_ONLINE_3X_{QUOTE_CCY}", 200
 
 @app.route('/run-analysis', methods=['GET', 'POST'])
 def manual_analysis_trigger():
@@ -176,8 +177,8 @@ def manual_analysis_trigger():
         return jsonify({"status": "error", "message": "Pętla bota nie jest aktywna."}), 503
     return jsonify({
         "status": "success",
-        "message": "Silnik Futures 3x działa w pełni autonomicznie w tle.",
-        "engine": "ONLINE_3X_SANDBOX"
+        "message": f"Silnik Futures 3x ({QUOTE_CCY}) działa w pełni autonomicznie w tle.",
+        "engine": f"ONLINE_3X_{QUOTE_CCY}"
     }), 200
 
 # =========================================================================
@@ -785,7 +786,7 @@ class OKXFuturesClient:
             return None
 
     async def set_leverage(self, symbol: str, leverage: int = 3, pos_side: str = "long") -> bool:
-        """Wymusza dźwignię 3x z obsługą kodu 50011 (Too Many Requests) i automatycznym ponawianiem."""
+        """Wymusza dźwignię 3x i margines izolowany z obsługą kodu 50011 i fallbackiem."""
         for attempt in range(3):
             await self.rate_limiter.consume()
             request_path = "/api/v5/account/set-leverage"
@@ -800,8 +801,7 @@ class OKXFuturesClient:
                     if code == "0" or code == "51000" or "not modified" in data.get("msg", "").lower():
                         return True
                     if code == "50011":
-                        logger.warning(f"⚠️ [RATE-LIMIT-50011] Zbyt wiele zapytań dla {symbol} [{pos_side}]. Ponowienie za {1.5 * (attempt + 1)}s...")
-                        await asyncio.sleep(1.5 * (attempt + 1))
+                        await asyncio.sleep(0.5 * (attempt + 1))
                         continue
                     
                     # Fallback bez posSide
@@ -817,11 +817,11 @@ class OKXFuturesClient:
                         return False
             except Exception as e:
                 logger.error(f"[FUTURES-LEVERAGE] Błąd lewaru {symbol} [{pos_side}]: {e}")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
         return False
 
-    async def get_wallet_balances(self, preferred_ccy: str = "USDT") -> Dict[str, Any]:
-        """Pobiera kapitał i wolny depozyt, obsługując automatycznie USDT oraz USDC."""
+    async def get_wallet_balances(self, preferred_ccy: str = QUOTE_CCY) -> Dict[str, Any]:
+        """Pobiera kapitał i wolny depozyt z uwzględnieniem preferowanej waluty rozliczeniowej (np. USDC)."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}}
         await self.rate_limiter.consume()
@@ -1241,12 +1241,12 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                         if contracts <= 0 or actual_margin > available_cash:
                             continue
 
-                        logger.info(f"🚨 [MEAN-REV-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
 
                         if order_res and order_res.get("code") == "0":
+                            logger.info(f"🚨 [MEAN-REV-TRIGGER] Sukces SWAP {inst['label']} [{pos_side.upper()}] | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                             now_ts = time.time()
                             oco_res = await inst["client"].execute_futures_oco(
                                 inst["symbol"], pos_side=pos_side, quantity=contracts, price_tp=price_tp, price_sl=price_sl
@@ -1282,6 +1282,10 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                                     pos_side=pos_side, quantity=contracts, ord_type="market", reduce_only=True
                                 )
                                 await redis_trade.delete_key(pos_key)
+                        else:
+                            err_msg = order_res.get("msg") if order_res else "Brak odpowiedzi API"
+                            err_code = order_res.get("code") if order_res else "N/A"
+                            logger.error(f"❌ [ORDER-REJECTED] Mean Reversion odrzucone dla {inst['label']} [{pos_side.upper()}]: {err_msg} (Kod: {err_code})")
         except Exception as e:
             logger.error(f"❌ [MEAN-REV-ERROR] Błąd workera: {e}")
 
@@ -1360,12 +1364,12 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                         if contracts <= 0 or actual_margin > available_cash:
                             continue
 
-                        logger.info(f"🚨 [MOMENTUM-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] ROC: {mom['roc']}% | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
 
                         if order_res and order_res.get("code") == "0":
+                            logger.info(f"🚨 [MOMENTUM-TRIGGER] Sukces SWAP {inst['label']} [{pos_side.upper()}] ROC: {mom['roc']}% | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                             now_ts = time.time()
                             oco_res = await inst["client"].execute_futures_oco(
                                 inst["symbol"], pos_side=pos_side, quantity=contracts, price_tp=price_tp, price_sl=price_sl
@@ -1400,6 +1404,10 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                                     pos_side=pos_side, quantity=contracts, ord_type="market", reduce_only=True
                                 )
                                 await redis_trade.delete_key(pos_key)
+                        else:
+                            err_msg = order_res.get("msg") if order_res else "Brak odpowiedzi API"
+                            err_code = order_res.get("code") if order_res else "N/A"
+                            logger.error(f"❌ [ORDER-REJECTED] Momentum odrzucone dla {inst['label']} [{pos_side.upper()}]: {err_msg} (Kod: {err_code})")
         except Exception as e:
             logger.error(f"❌ [MOMENTUM-ERROR] Błąd workera: {e}")
 
@@ -1474,12 +1482,12 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                         if contracts <= 0 or actual_margin > available_cash:
                             continue
 
-                        logger.info(f"🚨 [BREAKOUT-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] Bw: {brk['bandwidth']} | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
 
                         if order_res and order_res.get("code") == "0":
+                            logger.info(f"🚨 [BREAKOUT-TRIGGER] Sukces SWAP {inst['label']} [{pos_side.upper()}] Bw: {brk['bandwidth']} | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                             now_ts = time.time()
                             oco_res = await inst["client"].execute_futures_oco(
                                 inst["symbol"], pos_side=pos_side, quantity=contracts, price_tp=price_tp, price_sl=price_sl
@@ -1514,6 +1522,10 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                     pos_side=pos_side, quantity=contracts, ord_type="market", reduce_only=True
                                 )
                                 await redis_trade.delete_key(pos_key)
+                        else:
+                            err_msg = order_res.get("msg") if order_res else "Brak odpowiedzi API"
+                            err_code = order_res.get("code") if order_res else "N/A"
+                            logger.error(f"❌ [ORDER-REJECTED] Breakout odrzucone dla {inst['label']} [{pos_side.upper()}]: {err_msg} (Kod: {err_code})")
         except Exception as e:
             logger.error(f"❌ [BREAKOUT-ERROR] Błąd workera: {e}")
 
@@ -1588,12 +1600,12 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                         if contracts <= 0 or actual_margin > available_cash:
                             continue
 
-                        logger.info(f"🎯 [PULLBACK-TRIGGER] Wejście z trendem {inst['label']} [{pos_side.upper()}] EMA-20: {pb['ema_20']} | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
 
                         if order_res and order_res.get("code") == "0":
+                            logger.info(f"🎯 [PULLBACK-TRIGGER] Sukces SWAP {inst['label']} [{pos_side.upper()}] EMA-20: {pb['ema_20']} | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                             now_ts = time.time()
                             oco_res = await inst["client"].execute_futures_oco(
                                 inst["symbol"], pos_side=pos_side, quantity=contracts, price_tp=price_tp, price_sl=price_sl
@@ -1628,6 +1640,10 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                                     pos_side=pos_side, quantity=contracts, ord_type="market", reduce_only=True
                                 )
                                 await redis_trade.delete_key(pos_key)
+                        else:
+                            err_msg = order_res.get("msg") if order_res else "Brak odpowiedzi API"
+                            err_code = order_res.get("code") if order_res else "N/A"
+                            logger.error(f"❌ [ORDER-REJECTED] Trend Pullback odrzucone dla {inst['label']} [{pos_side.upper()}]: {err_msg} (Kod: {err_code})")
         except Exception as e:
             logger.error(f"❌ [PULLBACK-ERROR] Błąd workera: {e}")
 
@@ -1638,7 +1654,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER, GLOBAL_WS_FEED, GLOBAL_ALPHA_LOCK
-    logger.info("⚡ [ENGINE ONLINE] Uruchamianie Silnika Futures 3x (Sandbox)...")
+    logger.info(f"⚡ [ENGINE ONLINE] Uruchamianie Silnika Futures 3x ({QUOTE_CCY} / Sandbox)...")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
     GLOBAL_ALPHA_LOCK = asyncio.Lock()
     if RATE_LIMITER is None:
@@ -1661,18 +1677,19 @@ async def continuous_async_cron(loop):
 
         # 1. Konfiguracja konta SWAP przy starcie z opóźnieniami rate-limit
         await okx_client.set_position_mode("long_short_mode")
+        await asyncio.sleep(0.5)
         symbols_to_stream = [item["symbol"] for item in FUTURES_INSTRUMENTS]
         for sym in symbols_to_stream:
             spec = await okx_client.load_instrument_specification(sym)
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.3)
             lev_l = await okx_client.set_leverage(sym, TARGET_LEVERAGE, "long")
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.3)
             lev_s = await okx_client.set_leverage(sym, TARGET_LEVERAGE, "short")
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
             if spec:
                 logger.info(f"🛡️ [LEVERAGE-STATUS] {sym} | Dźwignia 3x [LONG: {lev_l}, SHORT: {lev_s}]")
 
-        await tg.push("🚀 <b>Silnik Futures 3x wystartował w Sandboxie!</b>")
+        await tg.push(f"🚀 <b>Silnik Futures 3x ({QUOTE_CCY}) wystartował w Sandboxie!</b>")
 
         # 2. Start workerów asynchronicznych
         tasks = [
@@ -1691,7 +1708,7 @@ async def continuous_async_cron(loop):
                 if heartbeat_timer >= 60:
                     heartbeat_timer = 0
                     prices_count = len(ws_feed.latest_prices)
-                    logger.info(f"💓 [ENGINE-HEARTBEAT] 4 workery aktywne | Strumień SWAP: {prices_count}/4 par | Sandbox: {IS_SANDBOX}")
+                    logger.info(f"💓 [ENGINE-HEARTBEAT] 4 workery aktywne | Strumień SWAP: {prices_count}/4 par | CCY: {QUOTE_CCY}")
         except Exception as e:
             logger.error(f"❌ [CRON-FATAL] Awaria pętli: {e}")
         finally:
@@ -1736,13 +1753,13 @@ def web_test_futures_environment():
             for item in FUTURES_INSTRUMENTS:
                 sym = item["symbol"]
                 spec = await client.load_instrument_specification(sym)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 ticker = await client.get_market_ticker(sym)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 lev_l = await client.set_leverage(sym, TARGET_LEVERAGE, "long")
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 lev_s = await client.set_leverage(sym, TARGET_LEVERAGE, "short")
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 instruments_report.append({
                     "symbol": sym,
                     "spec_loaded": spec is not None,
@@ -1755,7 +1772,7 @@ def web_test_futures_environment():
                 })
 
             return {
-                "system": "OKX_FUTURES_3X_MULTI_AGENT_ENGINE",
+                "system": f"OKX_FUTURES_3X_ENGINE_{QUOTE_CCY}",
                 "mode": "SANDBOX (DEMO)" if IS_SANDBOX else "LIVE_SUBACCOUNT",
                 "quote_ccy": QUOTE_CCY,
                 "redis_connected": redis_pong,
