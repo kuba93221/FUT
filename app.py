@@ -45,8 +45,8 @@ logger.propagate = False
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
 
 # INTELIGENTNY PRZEŁĄCZNIK ŚRODOWISKOWY:
-# W Sandboxie OKX obsługuje wyłącznie USDT-margined SWAP. Poza sandboxem (Live) używamy USDC zgodnie z wytycznymi.
-DEFAULT_CCY = "USDT" if IS_SANDBOX else "USDC"
+# STREAMING CHUNK: Konfigurowanie waluty kwotowanej USD/USDC pod rynek X-Perp...
+DEFAULT_CCY = "USD"
 QUOTE_CCY = os.environ.get("QUOTE_CCY", DEFAULT_CCY).strip().upper()
 TARGET_LEVERAGE = 3
 TARGET_MARGIN_MODE = "isolated"
@@ -59,30 +59,31 @@ ASYNC_SHUTDOWN_EVENT: Optional[asyncio.Event] = None
 RATE_LIMITER: Optional[Any] = None
 GLOBAL_WS_FEED: Optional[Any] = None
 
-# Oficjalne instrumenty na OKX dostosowane do aktywnego środowiska (USDT w Sandbox, USDC w Live)
+# STREAMING CHUNK: Aktualizowanie oficjalnych instrumentów X-Perp dopuszczonych w jurysdykcji EEA...
+# Oficjalne instrumenty X-Perp / FUTURES wykryte na koncie OKX EEA pod uprawnienie Expiry
 FUTURES_INSTRUMENTS = [
     {
-        "symbol": f"BTC-{QUOTE_CCY}-SWAP",
+        "symbol": "BTC-USD_UM_XPERP-310328",
         "base": "BTC",
-        "label": f"BTC_{QUOTE_CCY}",
+        "label": "BTC_USD_XPERP",
         "price_round": 2
     },
     {
-        "symbol": f"ETH-{QUOTE_CCY}-SWAP",
+        "symbol": "ETH-USD_UM_XPERP-310328",
         "base": "ETH",
-        "label": f"ETH_{QUOTE_CCY}",
+        "label": "ETH_USD_XPERP",
         "price_round": 2
     },
     {
-        "symbol": f"SOL-{QUOTE_CCY}-SWAP",
+        "symbol": "SOL-USD_UM-260925",
         "base": "SOL",
-        "label": f"SOL_{QUOTE_CCY}",
+        "label": "SOL_USD_FUT",
         "price_round": 2
     },
     {
-        "symbol": f"XRP-{QUOTE_CCY}-SWAP",
+        "symbol": "XRP-USD_UM_XPERP-310801",
         "base": "XRP",
-        "label": f"XRP_{QUOTE_CCY}",
+        "label": "XRP_USD_XPERP",
         "price_round": 4
     }
 ]
