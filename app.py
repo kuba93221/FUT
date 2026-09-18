@@ -587,11 +587,24 @@ class OKXWebSocketPriceFeed:
     def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = True):
         self.session = session
         self.is_sandbox = is_sandbox
-        # Oficjalne serwery WebSocket dla kont zarejestrowanych w Europie (EEA)
-        self.ws_url = "wss://wseeapap.okx.com:8443/ws/v5/public" if is_sandbox else "wss://wseea.okx.com:8443/ws/v5/public"
+        # Rynek publiczny cen (tickers) pobieramy z oficjalnego europejskiego strumienia live
+        # Zapewnia to ciagly, plynny strumien tickow rynkowych 24/7 (w Sandboxie brak obrotu na USDC)
+        self.ws_url = "wss://wseea.okx.com:8443/ws/v5/public"
         self.latest_prices: Dict[str, float] = {}
         self.last_msg_time = time.monotonic()
         self._running: bool = False
+
+    async def _ping_worker(self, ws):
+        """Wysyla tekstowy ping co 20 sekund zgodnie ze specyfikacja OKX WebSocket."""
+        try:
+            while not ws.closed and self._running:
+                await asyncio.sleep(20)
+                if not ws.closed:
+                    await ws.send_str("ping")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
     async def start_listener(self, symbols: list):
         self._running = True
@@ -600,35 +613,57 @@ class OKXWebSocketPriceFeed:
 
         while self._running and not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
             try:
-                mode_str = "SANDBOX" if self.is_sandbox else "LIVE"
-                logger.info(f"🌐 [WS-CONNECT] Łączenie z WebSocket OKX SWAP EEA ({mode_str}): {self.ws_url}...")
-                async with self.session.ws_connect(self.ws_url, heartbeat=20) as ws:
+                logger.info(f"🌐 [WS-CONNECT] Laczenie ze strumieniem cen OKX SWAP EEA: {self.ws_url}...")
+                async with self.session.ws_connect(self.ws_url, heartbeat=None) as ws:
                     await ws.send_str(subscribe_msg)
                     logger.info(f"📡 [WS-SUBSCRIBED] Subskrypcja SWAP aktywna dla {symbols}")
                     self.last_msg_time = time.monotonic()
 
-                    while self._running and not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
-                        try:
-                            msg = await asyncio.wait_for(ws.receive(), timeout=45.0)
-                        except asyncio.TimeoutError:
-                            logger.warning("⚠️ [WS-WATCHDOG] Brak pakietów przez 45s. Resetowanie WebSocket...")
-                            break
+                    # Uruchomienie dedykowanego workera ping-pong dla OKX
+                    ping_task = asyncio.create_task(self._ping_worker(ws))
 
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            self.last_msg_time = time.monotonic()
-                            data = json.loads(msg.data)
-                            if "data" in data and len(data["data"]) > 0:
-                                ticker = data["data"][0]
-                                inst_id = ticker.get("instId")
-                                last_price = ticker.get("last")
-                                if inst_id and last_price:
-                                    prev_p = self.latest_prices.get(inst_id)
-                                    self.latest_prices[inst_id] = float(last_price)
-                                    if prev_p is None:
-                                        logger.info(f"📡 [WS-FEED] Pierwszy kurs SWAP {inst_id}: {last_price} {QUOTE_CCY}")
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            logger.warning("⚠️ [WS-DISCONNECTED] Gniazdo WebSocket zamknięte. Wznawianie...")
-                            break
+                    try:
+                        while self._running and not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
+                            try:
+                                msg = await asyncio.wait_for(ws.receive(), timeout=45.0)
+                            except asyncio.TimeoutError:
+                                logger.warning("⚠️ [WS-WATCHDOG] Brak pakietow przez 45s. Resetowanie WebSocket...")
+                                break
+
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                self.last_msg_time = time.monotonic()
+                                # Obsluga odpowiedzi pong z serwera OKX
+                                if msg.data == "pong":
+                                    continue
+
+                                try:
+                                    data = json.loads(msg.data)
+                                except Exception:
+                                    continue
+
+                                # Logowanie potwierdzenia subskrypcji lub bledu z gieldy
+                                if "event" in data:
+                                    ev = data.get("event")
+                                    if ev == "subscribe":
+                                        logger.info(f"✅ [OKX-WS-CONFIRMED] Potwierdzono subskrypcje kanalu: {data.get('arg')}")
+                                    elif ev == "error":
+                                        logger.error(f"❌ [OKX-WS-ERROR] Odpowiedz bledu z OKX: {data}")
+                                    continue
+
+                                if "data" in data and len(data["data"]) > 0:
+                                    ticker = data["data"][0]
+                                    inst_id = ticker.get("instId")
+                                    last_price = ticker.get("last")
+                                    if inst_id and last_price:
+                                        prev_p = self.latest_prices.get(inst_id)
+                                        self.latest_prices[inst_id] = float(last_price)
+                                        if prev_p is None:
+                                            logger.info(f"📡 [WS-FEED] Pierwszy kurs SWAP {inst_id}: {last_price} {QUOTE_CCY}")
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                logger.warning("⚠️ [WS-DISCONNECTED] Gniazdo WebSocket zamkniete. Wznawianie...")
+                                break
+                    finally:
+                        ping_task.cancel()
             except Exception as e:
                 logger.error(f"❌ [WS-ERROR] Awaria strumienia SWAP: {e}. Wznawianie za 5s...")
                 await asyncio.sleep(5)
