@@ -576,7 +576,12 @@ class OKXWebSocketPriceFeed:
     def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = True):
         self.session = session
         self.is_sandbox = is_sandbox
-        self.ws_url = "wss://wspap.okx.com:8443/ws/v5/public" if is_sandbox else "wss://ws.okx.com:8443/ws/v5/public"
+        # [AKTUALIZACJA EEA]: Oficjalne serwery WebSocket OKX dla strefy europejskiej
+        self.ws_url = (
+            "wss://wseeapap.okx.com:8443/ws/v5/public" 
+            if is_sandbox 
+            else "wss://wseea.okx.com:8443/ws/v5/public"
+        )
         self.latest_prices: Dict[str, float] = {}
         self.last_msg_time = time.monotonic()
         self._running: bool = False
