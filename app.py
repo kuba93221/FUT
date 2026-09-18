@@ -124,6 +124,10 @@ def floor_to_precision(value: float, precision: int) -> float:
     factor = 10 ** precision
     return math.floor(value * factor) / factor
 
+def format_sz(quantity: float) -> str:
+    """Formatuje liczbę kontraktów bez zbędnych zer (np. 1.0 -> '1', 0.050 -> '0.05')."""
+    return f"{quantity:.8f}".rstrip('0').rstrip('.')
+
 def calculate_clamped_sl_tp(
     current_price: float,
     atr: float,
@@ -516,6 +520,8 @@ class PullbackQuantCore:
         highs = [float(c[2]) for c in candles]
         lows = [float(c[3]) for c in candles]
         current_price = closes[-1]
+        if current_price <= 0:
+            return None
 
         ema_20 = AlgorithmicQuantCore._calculate_ema(closes, period=20)
         ema_50 = AlgorithmicQuantCore._calculate_ema(closes, period=50)
@@ -768,8 +774,8 @@ class OKXFuturesClient:
                         "instId": item.get("instId"),
                         "ctVal": float(item.get("ctVal", 1.0)),
                         "ctValCcy": item.get("ctValCcy", ""),
-                        "minSz": float(item.get("minSz", 1.0)),
-                        "lotSz": float(item.get("lotSz", 1.0)),
+                        "minSz": float(item.get("minSz", 0.01)),
+                        "lotSz": float(item.get("lotSz", 0.01)),
                         "tickSz": float(item.get("tickSz", 0.1)),
                         "settleCcy": item.get("settleCcy", QUOTE_CCY)
                     }
@@ -820,14 +826,15 @@ class OKXFuturesClient:
                             "eq": float(b.get("eq", 0.0))
                         }
                     
-                    # Sprawdzenie dostępnej gotówki dla preferowanej waluty (USDT), fallback na USDC
                     avail_cash = 0.0
-                    if preferred_ccy in balances_map:
+                    if preferred_ccy in balances_map and balances_map[preferred_ccy]["availBal"] > 0:
                         avail_cash = balances_map[preferred_ccy]["availBal"]
                     elif "USDT" in balances_map and balances_map["USDT"]["availBal"] > 0:
                         avail_cash = balances_map["USDT"]["availBal"]
                     elif "USDC" in balances_map and balances_map["USDC"]["availBal"] > 0:
                         avail_cash = balances_map["USDC"]["availBal"]
+                    elif "USD" in balances_map and balances_map["USD"]["availBal"] > 0:
+                        avail_cash = balances_map["USD"]["availBal"]
                     
                     return {
                         "total_equity": total_eq,
@@ -846,35 +853,52 @@ class OKXFuturesClient:
         current_price: float,
         target_margin_quote: float,
         max_allowed_margin: float
-    ) -> Tuple[int, float]:
-        """Przelicza zaplanowany margines na liczbę kontraktów całkowitych sz."""
+    ) -> Tuple[float, float]:
+        """
+        Przelicza zaplanowany margines na liczbę kontraktów sz (obsługując kroki ułamkowe np. 0.01).
+        Eliminuje ryzyko ZeroDivisionError.
+        """
         spec = self.instruments_cache.get(symbol)
         if not spec or current_price <= 0:
-            return 0, 0.0
+            return 0.0, 0.0
 
-        ct_val = spec["ctVal"]
-        min_sz = int(spec["minSz"])
-        lot_sz = int(spec["lotSz"])
+        ct_val = float(spec.get("ctVal", 1.0))
+        min_sz = float(spec.get("minSz", 0.01))
+        lot_sz = float(spec.get("lotSz", 0.01))
+
+        if lot_sz <= 0:
+            lot_sz = 0.01
+        if min_sz <= 0:
+            min_sz = lot_sz
 
         contract_nominal_quote = ct_val * current_price
+        if contract_nominal_quote <= 0:
+            return 0.0, 0.0
+
         single_contract_margin = contract_nominal_quote / self.TARGET_LEVERAGE
 
         if (min_sz * single_contract_margin) > max_allowed_margin:
-            logger.warning(f"🛡️ [SIZING-REJECTED] {symbol}: 1 lot wymaga {round(min_sz * single_contract_margin, 2)} {QUOTE_CCY} > limit {round(max_allowed_margin, 2)} {QUOTE_CCY}.")
-            return 0, 0.0
+            logger.warning(f"🛡️ [SIZING-REJECTED] {symbol}: minSz ({min_sz}) wymaga {round(min_sz * single_contract_margin, 2)} {QUOTE_CCY} > limit {round(max_allowed_margin, 2)} {QUOTE_CCY}.")
+            return 0.0, 0.0
 
         target_nominal = target_margin_quote * self.TARGET_LEVERAGE
         raw_contracts = target_nominal / contract_nominal_quote
-        contracts = math.floor(raw_contracts / lot_sz) * lot_sz
+
+        # Precyzja kroków na podstawie lotSz (np. 0.01 -> 2 miejsca po przecinku)
+        lot_str = f"{lot_sz:.8f}".rstrip('0')
+        decimals = len(lot_str.split('.')[1]) if '.' in lot_str else 0
+
+        steps = math.floor(raw_contracts / lot_sz)
+        contracts = round(steps * lot_sz, decimals)
 
         if contracts < min_sz:
             if (min_sz * single_contract_margin) <= max_allowed_margin:
                 contracts = min_sz
             else:
-                return 0, 0.0
+                return 0.0, 0.0
 
         actual_margin = (contracts * contract_nominal_quote) / self.TARGET_LEVERAGE
-        return int(contracts), round(actual_margin, 2)
+        return contracts, round(actual_margin, 2)
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Pobiera kurs SWAP z WebSocket lub REST fallback."""
@@ -921,7 +945,7 @@ class OKXFuturesClient:
         symbol: str,
         side: str,
         pos_side: str,
-        quantity: int,
+        quantity: float,
         ord_type: str = "market",
         price: Optional[float] = None,
         reduce_only: bool = False
@@ -937,7 +961,7 @@ class OKXFuturesClient:
             "side": side.lower(),
             "posSide": pos_side.lower(),
             "ordType": ord_type.lower(),
-            "sz": str(quantity),
+            "sz": format_sz(quantity),
             "reduceOnly": reduce_only
         }
         if ord_type == "limit" and price is not None:
@@ -957,7 +981,7 @@ class OKXFuturesClient:
         self,
         symbol: str,
         pos_side: str,
-        quantity: int,
+        quantity: float,
         price_tp: float,
         price_sl: float
     ) -> Optional[Dict[str, Any]]:
@@ -973,7 +997,7 @@ class OKXFuturesClient:
             "side": exit_side,
             "posSide": pos_side,
             "ordType": "oco",
-            "sz": str(quantity),
+            "sz": format_sz(quantity),
             "reduceOnly": True,
             "tpTriggerPx": str(price_tp),
             "tpOrdPx": "-1",
@@ -1047,7 +1071,7 @@ async def reconcile_and_timestop_futures(
     if pos_data.get("status") == "WAITING_OCO" and "algo_id" in pos_data:
         algo_id = pos_data["algo_id"]
         pos_side = pos_data.get("pos_side", "long")
-        contracts = int(pos_data.get("contracts", 1))
+        contracts = float(pos_data.get("contracts", 0.01))
         algo_state, actual_px = await inst["client"].get_algo_order_state(algo_id)
 
         opened_at = float(pos_data.get("time", time.time()))
@@ -1077,7 +1101,7 @@ async def reconcile_and_timestop_futures(
                 f"──────────────────────────────\n"
                 f"📈 Strategia: <b>{strategy_type}</b> [{pos_side.upper()}]\n"
                 f"⌛ Czas: <b>{round(elapsed_time/3600, 1)}h</b> / Limit: {round(max_timeout/3600, 1)}h\n"
-                f"📦 Kontrakty: <b>{contracts} sz</b> (Lewar: 3x)\n"
+                f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Lewar: 3x)\n"
                 f"Pozycja zlikwidowana rynkowo z reduceOnly. Slot uwolniony."
             )
             return True, pos_key
@@ -1111,7 +1135,7 @@ async def reconcile_and_timestop_futures(
                     f"──────────────────────────────\n"
                     f"📈 Strategia: <b>{strategy_type}</b> [{pos_side.upper()}]\n"
                     f"💰 Wyjście: <b>{exit_p} {QUOTE_CCY}</b> (Wejście: {entry_p} {QUOTE_CCY})\n"
-                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: {margin_locked} {QUOTE_CCY} 3x)\n"
+                    f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: {margin_locked} {QUOTE_CCY} 3x)\n"
                     f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY} ({roe_net}%)</b>\n"
                     f"Slot ALFA zwolniony."
                 )
@@ -1201,10 +1225,10 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                         contracts, actual_margin = inst["client"].calculate_contract_size(
                             inst["symbol"], current_price, target_margin, safe_cash
                         )
-                        if contracts < 1 or actual_margin > available_cash:
+                        if contracts <= 0 or actual_margin > available_cash:
                             continue
 
-                        logger.info(f"🚨 [MEAN-REV-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] | Kontrakty: {contracts} | Margines: {actual_margin} {QUOTE_CCY}")
+                        logger.info(f"🚨 [MEAN-REV-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
@@ -1233,7 +1257,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                                     f"──────────────────────────────\n"
                                     f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
                                     f"💰 Kurs wejścia: <b>{current_price} {QUOTE_CCY}</b>\n"
-                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
+                                    f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
                                     f"Strażnik Czasu: 8h | OCO: AKTYWNE"
@@ -1321,10 +1345,10 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                         contracts, actual_margin = inst["client"].calculate_contract_size(
                             inst["symbol"], current_price, target_margin, safe_cash
                         )
-                        if contracts < 1 or actual_margin > available_cash:
+                        if contracts <= 0 or actual_margin > available_cash:
                             continue
 
-                        logger.info(f"🚨 [MOMENTUM-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] ROC: {mom['roc']}% | Kontrakty: {contracts}")
+                        logger.info(f"🚨 [MOMENTUM-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] ROC: {mom['roc']}% | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
@@ -1353,7 +1377,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                                     f"──────────────────────────────\n"
                                     f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
                                     f"💰 Kurs: <b>{current_price} {QUOTE_CCY}</b> (ROC: {mom['roc']}%)\n"
-                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
+                                    f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
                                     f"Strażnik Czasu: 6h | OCO: AKTYWNE"
@@ -1436,10 +1460,10 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                         contracts, actual_margin = inst["client"].calculate_contract_size(
                             inst["symbol"], current_price, target_margin, safe_cash
                         )
-                        if contracts < 1 or actual_margin > available_cash:
+                        if contracts <= 0 or actual_margin > available_cash:
                             continue
 
-                        logger.info(f"🚨 [BREAKOUT-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] Bw: {brk['bandwidth']} | Kontrakty: {contracts}")
+                        logger.info(f"🚨 [BREAKOUT-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] Bw: {brk['bandwidth']} | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
@@ -1468,7 +1492,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                     f"──────────────────────────────\n"
                                     f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
                                     f"💰 Kurs: <b>{current_price} {QUOTE_CCY}</b> (Banda: {brk['upper_band'] if pos_side == 'long' else brk['lower_band']})\n"
-                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
+                                    f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
                                     f"Strażnik Czasu: 6h | OCO: AKTYWNE"
@@ -1551,10 +1575,10 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                         contracts, actual_margin = inst["client"].calculate_contract_size(
                             inst["symbol"], current_price, target_margin, safe_cash
                         )
-                        if contracts < 1 or actual_margin > available_cash:
+                        if contracts <= 0 or actual_margin > available_cash:
                             continue
 
-                        logger.info(f"🎯 [PULLBACK-TRIGGER] Wejście z trendem {inst['label']} [{pos_side.upper()}] EMA-20: {pb['ema_20']} | Kontrakty: {contracts}")
+                        logger.info(f"🎯 [PULLBACK-TRIGGER] Wejście z trendem {inst['label']} [{pos_side.upper()}] EMA-20: {pb['ema_20']} | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
@@ -1583,7 +1607,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                                     f"──────────────────────────────\n"
                                     f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
                                     f"💰 Kurs: <b>{current_price} {QUOTE_CCY}</b> (EMA-20: {pb['ema_20']})\n"
-                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
+                                    f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
                                     f"Strażnik Czasu: 6h | OCO: AKTYWNE"
@@ -1702,6 +1726,8 @@ def web_test_futures_environment():
                     "symbol": sym,
                     "spec_loaded": spec is not None,
                     "ct_val": spec["ctVal"] if spec else None,
+                    "min_sz": spec["minSz"] if spec else None,
+                    "lot_sz": spec["lotSz"] if spec else None,
                     "settle_ccy": spec["settleCcy"] if spec else None,
                     "current_price": ticker["last"] if ticker else 0.0,
                     "leverage_3x_locked": (lev_l and lev_s)
@@ -1773,7 +1799,7 @@ def emergency_liquidate_to_cash():
                         if raw_data:
                             sym = raw_data.get("inst_id") or f"{p_key.split(':')[-1].split('_')[0]}-{QUOTE_CCY}-SWAP"
                             pos_side = raw_data.get("pos_side", "long")
-                            contracts = int(raw_data.get("contracts", 1))
+                            contracts = float(raw_data.get("contracts", 0.01))
                             exit_side = "sell" if pos_side == "long" else "buy"
 
                             if "algo_id" in raw_data:
