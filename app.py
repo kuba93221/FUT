@@ -18,9 +18,8 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 # =========================================================================
-# SYSTEMOWY MODUŁ OBSERVABILITY & TELEMETRII (v11.4 FUTURES 3X)
+# SYSTEMOWY MODUŁ OBSERVABILITY & TELEMETRII (v11.5 FUTURES 3X)
 # =========================================================================
-# Wymuszenie natychmiastowego zrzutu logów w kontenerze Render (brak buforowania)
 try:
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(line_buffering=True)
@@ -45,7 +44,6 @@ logger.propagate = False
 
 print("🚀 [BOOT] Silnik Futures 3x (Sandbox) inicjalizuje telemetrie na Renderze...", flush=True)
 
-# Wymuszenie trybu Demo / Sandbox (domyślnie True dla pełnego bezpieczeństwa środków)
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
 logger.info(f"⚙️ [SYSTEM-INIT] Silnik Futures 3x Online [ATOMOWY LOCK | DUAL TIME-STOP | LEWAR: 3x IZOLOWANY | SANDBOX: {IS_SANDBOX}]")
 
@@ -55,7 +53,7 @@ ASYNC_SHUTDOWN_EVENT: Optional[asyncio.Event] = None
 RATE_LIMITER: Optional[Any] = None
 GLOBAL_WS_FEED: Optional[Any] = None
 
-# Waluta kwotowana kontraktów perpetual SWAP na OKX (oficjalnie USDT dla rynku liniowego SWAP)
+# Waluta kwotowana kontraktów perpetual SWAP na OKX (oficjalnie USDT dla rynku liniowego SWAP w Europie)
 QUOTE_CCY = os.environ.get("QUOTE_CCY", "USDT").strip().upper()
 TARGET_LEVERAGE = 3
 TARGET_MARGIN_MODE = "isolated"
@@ -76,7 +74,7 @@ CONFIG = {
     "MIN_ORDER_VALUE_QUOTE": 11.0,
     "RESERVE_CASH_BUFFER_QUOTE": 3.0,
     "RISK_PER_TRADE_PCT": 0.01,
-    "MAX_POSITION_PORTFOLIO_RATIO": 0.18,  # max ~18% portfela na margines izolowany
+    "MAX_POSITION_PORTFOLIO_RATIO": 0.18,  # max ~18% wolnej gotówki na margines izolowany
     "DYNAMIC_RISK": {
         "MIN_SL_PCT": 0.008,      # 0.8% ruchu bazowego = 2.4% straty na 3x
         "MAX_SL_HARD_CAP": 0.020, # 2.0% ruchu bazowego = 6.0% straty na 3x
@@ -594,7 +592,7 @@ class OKXWebSocketPriceFeed:
         self.session = session
         self.is_sandbox = is_sandbox
         self.ws_endpoints = [
-            "wss://wseea.okx.com:8443/ws/v5/public",
+            "wss://wseeapap.okx.com:8443/ws/v5/public" if is_sandbox else "wss://wseea.okx.com:8443/ws/v5/public",
             "wss://wsaws.okx.com:8443/ws/v5/public",
             "wss://ws.okx.com:8443/ws/v5/public"
         ]
@@ -797,7 +795,10 @@ class OKXFuturesClient:
             async with self.session.post(url, data=body, headers=headers, timeout=5) as resp:
                 data = await resp.json()
                 code = data.get("code")
-                return code == "0" or code == "51000" or "not modified" in data.get("msg", "").lower()
+                if code == "0" or code == "51000" or "not modified" in data.get("msg", "").lower():
+                    return True
+                logger.error(f"❌ [FUTURES-LEVERAGE-ERROR] {symbol} [{pos_side}]: {data.get('msg')} (kod: {code})")
+                return False
         except Exception as e:
             logger.error(f"[FUTURES-LEVERAGE] Błąd lewaru {symbol} [{pos_side}]: {e}")
             return False
@@ -854,7 +855,7 @@ class OKXFuturesClient:
     ) -> Tuple[float, float]:
         """
         Przelicza zaplanowany margines na liczbę kontraktów sz z uwzględnieniem ctVal i lotSz.
-        Skalowanie dynamiczne oparte wyłącznie na dostępnej gotówce (available_cash).
+        Bazuje wyłącznie na dostępnej wolnej gotówce (available_cash).
         """
         spec = self.instruments_cache.get(symbol)
         if not spec or current_price <= 0:
@@ -1200,7 +1201,6 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                             continue
 
                         wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
-                        total_balance = wallet.get("total_equity", 0.0)
                         available_cash = wallet.get("available_cash", 0.0)
 
                         if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
@@ -1320,7 +1320,6 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                             continue
 
                         wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
-                        total_balance = wallet.get("total_equity", 0.0)
                         available_cash = wallet.get("available_cash", 0.0)
 
                         if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
@@ -1435,7 +1434,6 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                             continue
 
                         wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
-                        total_balance = wallet.get("total_equity", 0.0)
                         available_cash = wallet.get("available_cash", 0.0)
 
                         if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
@@ -1505,7 +1503,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
         await asyncio.sleep(180)
 
 # =========================================================================
-# WORKER 4: TREND PULLBACK (RETEST EMA-20 - ZASTĄPIENIE GRIDU)
+# WORKER 4: TREND PULLBACK (RETEST EMA-20)
 # =========================================================================
 async def independent_pullback_worker(session, redis_trade, tg, okx_client):
     logger.info("🎯 [PULLBACK-WORKER] Start autonomicznego wątku Trend Pullback (retest EMA-20).")
@@ -1550,7 +1548,6 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                             continue
 
                         wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
-                        total_balance = wallet.get("total_equity", 0.0)
                         available_cash = wallet.get("available_cash", 0.0)
 
                         if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
@@ -1768,7 +1765,6 @@ def emergency_liquidate_to_cash():
             )
             report = {"cancelled_orders": [], "closed_positions": [], "redis_cleaned": False}
 
-            # 1. Anulowanie wszystkich zleceń oczekujących
             for item in FUTURES_INSTRUMENTS:
                 sym = item["symbol"]
                 try:
@@ -1786,7 +1782,6 @@ def emergency_liquidate_to_cash():
                 except Exception as ex:
                     logger.error(f"⚠️ [EMERGENCY] Błąd anulowania {sym}: {ex}")
 
-            # 2. Zamknięcie wszystkich aktywnych pozycji kontraktowych z bazy Redis
             url_pos = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
             all_pos_keys = []
             async with session.get(url_pos, headers=redis_trade.headers) as r_pos:
@@ -1808,7 +1803,6 @@ def emergency_liquidate_to_cash():
                             )
                             report["closed_positions"].append({"symbol": sym, "side": pos_side, "contracts": contracts, "result": res})
 
-            # 3. Wyczyszczenie kluczy pozycji w Upstash Redis
             if all_pos_keys:
                 del_payload = [["DEL"] + all_pos_keys]
                 await session.post(f"{redis_trade.url}/pipeline", json=del_payload, headers=redis_trade.headers)
