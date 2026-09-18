@@ -18,7 +18,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 # =========================================================================
-# SYSTEMOWY MODUŁ OBSERVABILITY & TELEMETRII (v11.5 FUTURES 3X)
+# STREAMING CHUNK: Inicjalizowanie modułu telemetrii i logowania...
 # =========================================================================
 try:
     if hasattr(sys.stdout, 'reconfigure'):
@@ -42,12 +42,12 @@ _stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(
 logger.addHandler(_stream_handler)
 logger.propagate = False
 
-print("🚀 [BOOT] Silnik Futures 3x (USDC/Sandbox) inicjalizuje telemetrie na Renderze...", flush=True)
-
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
 
-# Waluta kwotowana kontraktów perpetual SWAP na OKX (domyślnie USDC zgodnie z wytycznymi produkcyjnymi)
-QUOTE_CCY = os.environ.get("QUOTE_CCY", "USDC").strip().upper()
+# INTELIGENTNY PRZEŁĄCZNIK ŚRODOWISKOWY:
+# W Sandboxie OKX obsługuje wyłącznie USDT-margined SWAP. Poza sandboxem (Live) używamy USDC zgodnie z wytycznymi.
+DEFAULT_CCY = "USDT" if IS_SANDBOX else "USDC"
+QUOTE_CCY = os.environ.get("QUOTE_CCY", DEFAULT_CCY).strip().upper()
 TARGET_LEVERAGE = 3
 TARGET_MARGIN_MODE = "isolated"
 
@@ -59,7 +59,7 @@ ASYNC_SHUTDOWN_EVENT: Optional[asyncio.Event] = None
 RATE_LIMITER: Optional[Any] = None
 GLOBAL_WS_FEED: Optional[Any] = None
 
-# Oficjalne instrumenty SWAP na OKX rozliczane w QUOTE_CCY (np. USDC-Margined)
+# Oficjalne instrumenty SWAP na OKX dostosowane do aktywnego środowiska (USDT w Sandbox, USDC w Live)
 FUTURES_INSTRUMENTS = [
     {"symbol": f"BTC-{QUOTE_CCY}-SWAP", "base": "BTC", "label": f"BTC_{QUOTE_CCY}", "price_round": 2},
     {"symbol": f"ETH-{QUOTE_CCY}-SWAP", "base": "ETH", "label": f"ETH_{QUOTE_CCY}", "price_round": 2},
@@ -68,7 +68,7 @@ FUTURES_INSTRUMENTS = [
 ]
 
 # =========================================================================
-# CENTRALNA KONFIGURACJA PARAMETRYCZNA (FUTURES 3X)
+# STREAMING CHUNK: Definiowanie centralnej konfiguracji parametrycznej...
 # =========================================================================
 CONFIG = {
     "ALPHA_MAX_ACTIVE_SLOTS": 3,
@@ -158,7 +158,7 @@ def calculate_clamped_sl_tp(
     return price_sl, price_tp, sl_pct
 
 # =========================================================================
-# SERWER MONITORINGU FLASK (ALWAYS-ON NA RENDERZE)
+# STREAMING CHUNK: Inicjalizowanie serwera monitoringu Flask...
 # =========================================================================
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
@@ -182,7 +182,7 @@ def manual_analysis_trigger():
     }), 200
 
 # =========================================================================
-# REGULATOR PRZEPŁYWU SIECIOWEGO (TOKEN BUCKET RATE LIMITER)
+# STREAMING CHUNK: Konfigurowanie regulatora przepływu TokenBucketRateLimiter...
 # =========================================================================
 class TokenBucketRateLimiter:
     """Rygorystyczny regulator przepustowości zapytań do API OKX (max 4 req/s)."""
@@ -209,7 +209,7 @@ class TokenBucketRateLimiter:
                 self.tokens -= 1.0
 
 # =========================================================================
-# POMOST UPSTASH REDIS (SEPARACJA: DEDYKOWANY PREFIKS FUTURES_3X_)
+# STREAMING CHUNK: Inicjalizowanie mostka UpstashRedisFuturesBridge...
 # =========================================================================
 class UpstashRedisFuturesBridge:
     """Dedykowany mostek Upstash Redis z kompresją binarną MessagePack do formatu HEX."""
@@ -352,7 +352,7 @@ class UpstashRedisFuturesBridge:
             return False
 
 # =========================================================================
-# DYSPOZYTOR POWIADOMIEŃ TELEGRAM
+# STREAMING CHUNK: Konfigurowanie dyspozytora powiadomień Telegram...
 # =========================================================================
 class TelegramThrottledDispatcher:
     def __init__(self, token: str, chat_id: str, session: aiohttp.ClientSession):
@@ -368,11 +368,11 @@ class TelegramThrottledDispatcher:
             payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
             async with self.session.post(url, json=payload, timeout=10) as response:
                 await response.read()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"❌ [TELEGRAM-ERROR] Błąd wysyłania powiadomienia: {e}")
 
 # =========================================================================
-# RDZENIE OBLICZENIOWE QUANT (MEAN REV, MOMENTUM, BREAKOUT, TREND PULLBACK)
+# STREAMING CHUNK: Implementowanie rdzeni analitycznych Quant (Mean Rev, Momentum, Breakout, Pullback)...
 # =========================================================================
 class AlgorithmicQuantCore:
     @staticmethod
@@ -586,7 +586,7 @@ class MarketRegimeArbitrator:
         return "NEUTRAL"
 
 # =========================================================================
-# KLIENT ASYNCHRONICZNY WEBSOCKET Z FAILOVER I DEDYKOWANYM PINGIEM OKX
+# STREAMING CHUNK: Konfigurowanie klienta WebSocket z failover...
 # =========================================================================
 class OKXWebSocketPriceFeed:
     def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = True):
@@ -681,7 +681,7 @@ class OKXWebSocketPriceFeed:
         return self.latest_prices.get(symbol)
 
 # =========================================================================
-# SYSTEMOWY KLIENT GIEŁDY OKX FUTURES / SWAP (API V5 REST)
+# STREAMING CHUNK: Inicjalizowanie klienta OKXFuturesClient...
 # =========================================================================
 class OKXFuturesClient:
     """Wyspecjalizowany klient OKX API V5 dla rynku SWAP z dźwignią 3x i marginesem izolowanym."""
@@ -755,35 +755,40 @@ class OKXFuturesClient:
             return False
 
     async def load_instrument_specification(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Pobiera parametry kontraktu (ctVal, lotSz, minSz, tickSz) dla SWAP."""
-        await self.rate_limiter.consume()
-        request_path = f"/api/v5/public/instruments?instType=SWAP&instId={symbol}"
-        url = f"{self.base_url}{request_path}"
-        headers = {"Content-Type": "application/json"}
-        if self.is_sandbox:
-            headers["x-simulated-trading"] = "1"
-        try:
-            async with self.session.get(url, headers=headers, timeout=5) as resp:
-                data = await resp.json()
-                if data.get("code") == "0" and data.get("data"):
-                    item = data["data"][0]
-                    spec = {
-                        "instId": item.get("instId"),
-                        "ctVal": float(item.get("ctVal", 1.0)),
-                        "ctValCcy": item.get("ctValCcy", ""),
-                        "minSz": float(item.get("minSz", 0.01)),
-                        "lotSz": float(item.get("lotSz", 0.01)),
-                        "tickSz": float(item.get("tickSz", 0.1)),
-                        "settleCcy": item.get("settleCcy", QUOTE_CCY)
-                    }
-                    self.instruments_cache[symbol] = spec
-                    logger.info(f"📋 [SPEC-LOADED] {symbol} | ctVal: {spec['ctVal']} {spec['ctValCcy']} | minSz: {spec['minSz']} | lotSz: {spec['lotSz']}")
-                    return spec
-                logger.warning(f"⚠️ [SPEC-FAILED] Brak specyfikacji dla {symbol}: {data}")
-                return None
-        except Exception as e:
-            logger.error(f"[FUTURES-SPEC] Błąd specyfikacji {symbol}: {e}")
-            return None
+        """Pobiera parametry kontraktu (ctVal, lotSz, minSz, tickSz) dla SWAP z mechanizmem ponawiania."""
+        for attempt in range(3):
+            await self.rate_limiter.consume()
+            request_path = f"/api/v5/public/instruments?instType=SWAP&instId={symbol}"
+            url = f"{self.base_url}{request_path}"
+            headers = {"Content-Type": "application/json"}
+            if self.is_sandbox:
+                headers["x-simulated-trading"] = "1"
+            try:
+                async with self.session.get(url, headers=headers, timeout=5) as resp:
+                    data = await resp.json()
+                    if data.get("code") == "0" and data.get("data"):
+                        item = data["data"][0]
+                        spec = {
+                            "instId": item.get("instId"),
+                            "ctVal": float(item.get("ctVal", 1.0)),
+                            "ctValCcy": item.get("ctValCcy", ""),
+                            "minSz": float(item.get("minSz", 0.01)),
+                            "lotSz": float(item.get("lotSz", 0.01)),
+                            "tickSz": float(item.get("tickSz", 0.1)),
+                            "settleCcy": item.get("settleCcy", QUOTE_CCY)
+                        }
+                        self.instruments_cache[symbol] = spec
+                        logger.info(f"📋 [SPEC-LOADED] {symbol} | ctVal: {spec['ctVal']} {spec['ctValCcy']} | minSz: {spec['minSz']} | lotSz: {spec['lotSz']}")
+                        return spec
+                    elif data.get("code") == "50011":
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                    logger.warning(f"⚠️ [SPEC-FAILED] Brak specyfikacji dla {symbol}: {data}")
+                    return None
+            except Exception as e:
+                logger.error(f"[FUTURES-SPEC] Błąd specyfikacji {symbol}: {e}")
+                await asyncio.sleep(0.5)
+        return None
 
     async def set_leverage(self, symbol: str, leverage: int = 3, pos_side: str = "long") -> bool:
         """Wymusza dźwignię 3x i margines izolowany z obsługą kodu 50011 i fallbackiem."""
@@ -821,7 +826,7 @@ class OKXFuturesClient:
         return False
 
     async def get_wallet_balances(self, preferred_ccy: str = QUOTE_CCY) -> Dict[str, Any]:
-        """Pobiera kapitał i wolny depozyt z uwzględnieniem preferowanej waluty rozliczeniowej (np. USDC)."""
+        """Pobiera kapitał i wolny depozyt z uwzględnieniem preferowanej waluty rozliczeniowej."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}}
         await self.rate_limiter.consume()
@@ -845,10 +850,10 @@ class OKXFuturesClient:
                     avail_cash = 0.0
                     if preferred_ccy in balances_map and balances_map[preferred_ccy]["availBal"] > 0:
                         avail_cash = balances_map[preferred_ccy]["availBal"]
-                    elif "USDC" in balances_map and balances_map["USDC"]["availBal"] > 0:
-                        avail_cash = balances_map["USDC"]["availBal"]
                     elif "USDT" in balances_map and balances_map["USDT"]["availBal"] > 0:
                         avail_cash = balances_map["USDT"]["availBal"]
+                    elif "USDC" in balances_map and balances_map["USDC"]["availBal"] > 0:
+                        avail_cash = balances_map["USDC"]["availBal"]
                     elif "USD" in balances_map and balances_map["USD"]["availBal"] > 0:
                         avail_cash = balances_map["USD"]["availBal"]
                     
@@ -870,10 +875,7 @@ class OKXFuturesClient:
         target_margin_quote: float,
         max_allowed_margin: float
     ) -> Tuple[float, float]:
-        """
-        Przelicza zaplanowany margines na liczbę kontraktów sz z uwzględnieniem ctVal i lotSz.
-        Bazuje wyłącznie na dostępnej wolnej gotówce (available_cash).
-        """
+        """Przelicza zaplanowany margines na liczbę kontraktów sz z uwzględnieniem ctVal i lotSz."""
         spec = self.instruments_cache.get(symbol)
         if not spec or current_price <= 0:
             return 0.0, 0.0
@@ -964,7 +966,7 @@ class OKXFuturesClient:
         price: Optional[float] = None,
         reduce_only: bool = False
     ) -> Optional[Dict[str, Any]]:
-        """Składa zlecenie na rynku SWAP (izolowany margines)."""
+        """Składa zlecenie na rynku SWAP z weryfikacją kodu odpowiedzi OKX."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None
         await self.rate_limiter.consume()
@@ -986,7 +988,10 @@ class OKXFuturesClient:
         headers = self._get_headers("POST", request_path, body_json)
         try:
             async with self.session.post(url, data=body_json, headers=headers, timeout=5) as r:
-                return await r.json()
+                res_json = await r.json()
+                if res_json.get("code") != "0":
+                    logger.error(f"❌ [OKX-ORDER-REJECTED] {symbol} [{pos_side}]: {res_json.get('msg')} (kod: {res_json.get('code')})")
+                return res_json
         except Exception as e:
             logger.error(f"❌ [OKX-ORDER-ERROR] Zlecenie {symbol} [{pos_side}]: {e}")
             return None
@@ -1023,7 +1028,10 @@ class OKXFuturesClient:
         headers = self._get_headers("POST", request_path, body_json)
         try:
             async with self.session.post(url, data=body_json, headers=headers, timeout=5) as r:
-                return await r.json()
+                res_json = await r.json()
+                if res_json.get("code") != "0":
+                    logger.error(f"❌ [OKX-OCO-REJECTED] {symbol} [{pos_side}]: {res_json.get('msg')} (kod: {res_json.get('code')})")
+                return res_json
         except Exception as e:
             logger.error(f"❌ [OKX-OCO-ERROR] Błąd OCO dla {symbol} [{pos_side}]: {e}")
             return None
@@ -1068,7 +1076,7 @@ class OKXFuturesClient:
             return None, None
 
 # =========================================================================
-# WSPÓLNA PROCEDURA RECONCILIACJI I DUAL TIME-STOP DLA FUTURES 3X
+# STREAMING CHUNK: Implementowanie reconciliacji i Dual Time-Stop...
 # =========================================================================
 async def reconcile_and_timestop_futures(
     inst: Dict[str, Any],
@@ -1158,7 +1166,7 @@ async def reconcile_and_timestop_futures(
     return False, None
 
 # =========================================================================
-# WORKER 1: MEAN REVERSION DUAL-DIRECTION (LONG & SHORT)
+# STREAMING CHUNK: Inicjalizowanie workerów strategii (Mean Rev, Momentum, Breakout, Pullback)...
 # =========================================================================
 async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client):
     logger.info("🌊 [MEAN-REV-WORKER] Start autonomicznego wątku Mean Reversion (Futures 3x).")
@@ -1282,18 +1290,11 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                                     pos_side=pos_side, quantity=contracts, ord_type="market", reduce_only=True
                                 )
                                 await redis_trade.delete_key(pos_key)
-                        else:
-                            err_msg = order_res.get("msg") if order_res else "Brak odpowiedzi API"
-                            err_code = order_res.get("code") if order_res else "N/A"
-                            logger.error(f"❌ [ORDER-REJECTED] Mean Reversion odrzucone dla {inst['label']} [{pos_side.upper()}]: {err_msg} (Kod: {err_code})")
         except Exception as e:
             logger.error(f"❌ [MEAN-REV-ERROR] Błąd workera: {e}")
 
         await asyncio.sleep(60)
 
-# =========================================================================
-# WORKER 2: MOMENTUM DUAL-DIRECTION (LONG & SHORT)
-# =========================================================================
 async def independent_momentum_worker(session, redis_trade, tg, okx_client):
     logger.info("🚀 [MOMENTUM-WORKER] Start autonomicznego wątku Momentum (Futures 3x).")
     instruments = [
@@ -1404,18 +1405,11 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                                     pos_side=pos_side, quantity=contracts, ord_type="market", reduce_only=True
                                 )
                                 await redis_trade.delete_key(pos_key)
-                        else:
-                            err_msg = order_res.get("msg") if order_res else "Brak odpowiedzi API"
-                            err_code = order_res.get("code") if order_res else "N/A"
-                            logger.error(f"❌ [ORDER-REJECTED] Momentum odrzucone dla {inst['label']} [{pos_side.upper()}]: {err_msg} (Kod: {err_code})")
         except Exception as e:
             logger.error(f"❌ [MOMENTUM-ERROR] Błąd workera: {e}")
 
         await asyncio.sleep(180)
 
-# =========================================================================
-# WORKER 3: BREAKOUT DUAL-DIRECTION (LONG & SHORT)
-# =========================================================================
 async def independent_breakout_worker(session, redis_trade, tg, okx_client):
     logger.info("💥 [BREAKOUT-WORKER] Start autonomicznego wątku Breakout (Futures 3x).")
     instruments = [
@@ -1522,18 +1516,11 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                     pos_side=pos_side, quantity=contracts, ord_type="market", reduce_only=True
                                 )
                                 await redis_trade.delete_key(pos_key)
-                        else:
-                            err_msg = order_res.get("msg") if order_res else "Brak odpowiedzi API"
-                            err_code = order_res.get("code") if order_res else "N/A"
-                            logger.error(f"❌ [ORDER-REJECTED] Breakout odrzucone dla {inst['label']} [{pos_side.upper()}]: {err_msg} (Kod: {err_code})")
         except Exception as e:
             logger.error(f"❌ [BREAKOUT-ERROR] Błąd workera: {e}")
 
         await asyncio.sleep(180)
 
-# =========================================================================
-# WORKER 4: TREND PULLBACK (RETEST EMA-20)
-# =========================================================================
 async def independent_pullback_worker(session, redis_trade, tg, okx_client):
     logger.info("🎯 [PULLBACK-WORKER] Start autonomicznego wątku Trend Pullback (retest EMA-20).")
     instruments = [
@@ -1600,12 +1587,12 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                         if contracts <= 0 or actual_margin > available_cash:
                             continue
 
+                        logger.info(f"🎯 [PULLBACK-TRIGGER] Sukces SWAP {inst['label']} [{pos_side.upper()}] EMA-20: {pb['ema_20']} | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
 
                         if order_res and order_res.get("code") == "0":
-                            logger.info(f"🎯 [PULLBACK-TRIGGER] Sukces SWAP {inst['label']} [{pos_side.upper()}] EMA-20: {pb['ema_20']} | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
                             now_ts = time.time()
                             oco_res = await inst["client"].execute_futures_oco(
                                 inst["symbol"], pos_side=pos_side, quantity=contracts, price_tp=price_tp, price_sl=price_sl
@@ -1640,21 +1627,17 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                                     pos_side=pos_side, quantity=contracts, ord_type="market", reduce_only=True
                                 )
                                 await redis_trade.delete_key(pos_key)
-                        else:
-                            err_msg = order_res.get("msg") if order_res else "Brak odpowiedzi API"
-                            err_code = order_res.get("code") if order_res else "N/A"
-                            logger.error(f"❌ [ORDER-REJECTED] Trend Pullback odrzucone dla {inst['label']} [{pos_side.upper()}]: {err_msg} (Kod: {err_code})")
         except Exception as e:
             logger.error(f"❌ [PULLBACK-ERROR] Błąd workera: {e}")
 
         await asyncio.sleep(120)
 
 # =========================================================================
-# GŁÓWNA PĘTLA ASYNCHRONICZNA WIELOZADANIOWA (CRON + WEBSOCKET)
+# STREAMING CHUNK: Inicjalizowanie głównej pętli asynchronicznej...
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER, GLOBAL_WS_FEED, GLOBAL_ALPHA_LOCK
-    logger.info(f"⚡ [ENGINE ONLINE] Uruchamianie Silnika Futures 3x ({QUOTE_CCY} / Sandbox)...")
+    logger.info(f"⚡ [ENGINE ONLINE] Uruchamianie Silnika Futures 3x ({QUOTE_CCY} / Sandbox: {IS_SANDBOX})...")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
     GLOBAL_ALPHA_LOCK = asyncio.Lock()
     if RATE_LIMITER is None:
@@ -1689,7 +1672,7 @@ async def continuous_async_cron(loop):
             if spec:
                 logger.info(f"🛡️ [LEVERAGE-STATUS] {sym} | Dźwignia 3x [LONG: {lev_l}, SHORT: {lev_s}]")
 
-        await tg.push(f"🚀 <b>Silnik Futures 3x ({QUOTE_CCY}) wystartował w Sandboxie!</b>")
+        await tg.push(f"🚀 <b>Silnik Futures 3x ({QUOTE_CCY}) wystartował!</b>")
 
         # 2. Start workerów asynchronicznych
         tasks = [
@@ -1731,7 +1714,7 @@ def background_scheduler_thread():
         loop.close()
 
 # =========================================================================
-# PUBLICZNE ENDPOINTY KONTROLNO-DIAGNOSTYCZNE FLASK
+# STREAMING CHUNK: Inicjalizowanie publicznych endpointów Flask...
 # =========================================================================
 @app.route('/test-futures-env', methods=['GET'])
 def web_test_futures_environment():
@@ -1861,7 +1844,7 @@ def emergency_liquidate_to_cash():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # =========================================================================
-# GŁÓWNY PUNKT STARTU (SIGNAL HANDLER DLA RENDERA)
+# STREAMING CHUNK: Inicjalizowanie głównego punktu startowego...
 # =========================================================================
 if __name__ == "__main__":
     worker_thread = threading.Thread(target=background_scheduler_thread, daemon=True)
