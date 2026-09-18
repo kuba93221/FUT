@@ -18,7 +18,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 # =========================================================================
-# SYSTEMOWY MODUŁ OBSERVABILITY & TELEMETRII (v11.3 FUTURES 3X)
+# SYSTEMOWY MODUŁ OBSERVABILITY & TELEMETRII (v11.4 FUTURES 3X)
 # =========================================================================
 # Wymuszenie natychmiastowego zrzutu logów w kontenerze Render (brak buforowania)
 try:
@@ -538,7 +538,6 @@ class PullbackQuantCore:
         is_uptrend = ema_20 > ema_50
         is_downtrend = ema_20 < ema_50
 
-        # Retest średniej w trendzie wzrostowym (Kupno LONG)
         dist_to_ema = abs(current_price - ema_20) / current_price
         near_ema = dist_to_ema <= tol
 
@@ -594,7 +593,6 @@ class OKXWebSocketPriceFeed:
     def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = True):
         self.session = session
         self.is_sandbox = is_sandbox
-        # Lista serwerów z automatycznym przełączaniem awaryjnym (Failover)
         self.ws_endpoints = [
             "wss://wseea.okx.com:8443/ws/v5/public",
             "wss://wsaws.okx.com:8443/ws/v5/public",
@@ -625,7 +623,7 @@ class OKXWebSocketPriceFeed:
         while self._running and not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
             ws_url = self.ws_endpoints[self.current_ep_index % len(self.ws_endpoints)]
             try:
-                logger.info(f"🌐 [WS-CONNECT] Łączenie ze strumieniem cen OKX SWAP: {ws_url}...")
+                logger.info(f"🌐 [WS-CONNECT] Łączenie ze strumieniem cen OKX SWAP EEA: {ws_url}...")
                 async with self.session.ws_connect(ws_url, heartbeat=None) as ws:
                     await ws.send_str(subscribe_msg)
                     logger.info(f"📡 [WS-SUBSCRIBED] Wysłano subskrypcję SWAP dla {symbols}")
@@ -829,10 +827,10 @@ class OKXFuturesClient:
                     avail_cash = 0.0
                     if preferred_ccy in balances_map and balances_map[preferred_ccy]["availBal"] > 0:
                         avail_cash = balances_map[preferred_ccy]["availBal"]
-                    elif "USDT" in balances_map and balances_map["USDT"]["availBal"] > 0:
-                        avail_cash = balances_map["USDT"]["availBal"]
                     elif "USDC" in balances_map and balances_map["USDC"]["availBal"] > 0:
                         avail_cash = balances_map["USDC"]["availBal"]
+                    elif "USDT" in balances_map and balances_map["USDT"]["availBal"] > 0:
+                        avail_cash = balances_map["USDT"]["availBal"]
                     elif "USD" in balances_map and balances_map["USD"]["availBal"] > 0:
                         avail_cash = balances_map["USD"]["availBal"]
                     
@@ -855,8 +853,8 @@ class OKXFuturesClient:
         max_allowed_margin: float
     ) -> Tuple[float, float]:
         """
-        Przelicza zaplanowany margines na liczbę kontraktów sz (obsługując kroki ułamkowe np. 0.01).
-        Eliminuje ryzyko ZeroDivisionError.
+        Przelicza zaplanowany margines na liczbę kontraktów sz z uwzględnieniem ctVal i lotSz.
+        Skalowanie dynamiczne oparte wyłącznie na dostępnej gotówce (available_cash).
         """
         spec = self.instruments_cache.get(symbol)
         if not spec or current_price <= 0:
@@ -878,13 +876,11 @@ class OKXFuturesClient:
         single_contract_margin = contract_nominal_quote / self.TARGET_LEVERAGE
 
         if (min_sz * single_contract_margin) > max_allowed_margin:
-            logger.warning(f"🛡️ [SIZING-REJECTED] {symbol}: minSz ({min_sz}) wymaga {round(min_sz * single_contract_margin, 2)} {QUOTE_CCY} > limit {round(max_allowed_margin, 2)} {QUOTE_CCY}.")
             return 0.0, 0.0
 
         target_nominal = target_margin_quote * self.TARGET_LEVERAGE
         raw_contracts = target_nominal / contract_nominal_quote
 
-        # Precyzja kroków na podstawie lotSz (np. 0.01 -> 2 miejsca po przecinku)
         lot_str = f"{lot_sz:.8f}".rstrip('0')
         decimals = len(lot_str.split('.')[1]) if '.' in lot_str else 0
 
@@ -1218,9 +1214,9 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                             pos_side=pos_side
                         )
 
-                        risk_capital = total_balance * CONFIG["RISK_PER_TRADE_PCT"]
+                        risk_capital = available_cash * CONFIG["RISK_PER_TRADE_PCT"]
                         safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
-                        target_margin = min(risk_capital / sl_pct, total_balance * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
+                        target_margin = min(risk_capital / sl_pct, available_cash * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
 
                         contracts, actual_margin = inst["client"].calculate_contract_size(
                             inst["symbol"], current_price, target_margin, safe_cash
@@ -1338,9 +1334,9 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                             pos_side=pos_side
                         )
 
-                        risk_capital = total_balance * CONFIG["RISK_PER_TRADE_PCT"]
+                        risk_capital = available_cash * CONFIG["RISK_PER_TRADE_PCT"]
                         safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
-                        target_margin = min(risk_capital / sl_pct, total_balance * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
+                        target_margin = min(risk_capital / sl_pct, available_cash * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
 
                         contracts, actual_margin = inst["client"].calculate_contract_size(
                             inst["symbol"], current_price, target_margin, safe_cash
@@ -1453,9 +1449,9 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                             pos_side=pos_side
                         )
 
-                        risk_capital = total_balance * CONFIG["RISK_PER_TRADE_PCT"]
+                        risk_capital = available_cash * CONFIG["RISK_PER_TRADE_PCT"]
                         safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
-                        target_margin = min(risk_capital / sl_pct, total_balance * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
+                        target_margin = min(risk_capital / sl_pct, available_cash * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
 
                         contracts, actual_margin = inst["client"].calculate_contract_size(
                             inst["symbol"], current_price, target_margin, safe_cash
@@ -1568,9 +1564,9 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                             pos_side=pos_side
                         )
 
-                        risk_capital = total_balance * CONFIG["RISK_PER_TRADE_PCT"]
+                        risk_capital = available_cash * CONFIG["RISK_PER_TRADE_PCT"]
                         safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
-                        target_margin = min(risk_capital / sl_pct, total_balance * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
+                        target_margin = min(risk_capital / sl_pct, available_cash * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
 
                         contracts, actual_margin = inst["client"].calculate_contract_size(
                             inst["symbol"], current_price, target_margin, safe_cash
@@ -1653,9 +1649,11 @@ async def continuous_async_cron(loop):
         await okx_client.set_position_mode("long_short_mode")
         symbols_to_stream = [item["symbol"] for item in FUTURES_INSTRUMENTS]
         for sym in symbols_to_stream:
-            await okx_client.load_instrument_specification(sym)
-            await okx_client.set_leverage(sym, TARGET_LEVERAGE, "long")
-            await okx_client.set_leverage(sym, TARGET_LEVERAGE, "short")
+            spec = await okx_client.load_instrument_specification(sym)
+            lev_l = await okx_client.set_leverage(sym, TARGET_LEVERAGE, "long")
+            lev_s = await okx_client.set_leverage(sym, TARGET_LEVERAGE, "short")
+            if spec:
+                logger.info(f"🛡️ [LEVERAGE-STATUS] {sym} | Dźwignia 3x [LONG: {lev_l}, SHORT: {lev_s}]")
 
         # 2. Start workerów asynchronicznych
         tasks = [
