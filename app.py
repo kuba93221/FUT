@@ -55,11 +55,12 @@ ASYNC_SHUTDOWN_EVENT: Optional[asyncio.Event] = None
 RATE_LIMITER: Optional[Any] = None
 GLOBAL_WS_FEED: Optional[Any] = None
 
-# Waluta kwotowana oraz specyfikacja koszyka perpetual swap
-QUOTE_CCY = "USDC"
+# Waluta kwotowana kontraktów perpetual SWAP na OKX (oficjalnie USDT dla rynku liniowego SWAP)
+QUOTE_CCY = os.environ.get("QUOTE_CCY", "USDT").strip().upper()
 TARGET_LEVERAGE = 3
 TARGET_MARGIN_MODE = "isolated"
 
+# Oficjalne instrumenty SWAP na OKX: BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP, XRP-USDT-SWAP
 FUTURES_INSTRUMENTS = [
     {"symbol": f"BTC-{QUOTE_CCY}-SWAP", "base": "BTC", "label": f"BTC_{QUOTE_CCY}", "price_round": 2},
     {"symbol": f"ETH-{QUOTE_CCY}-SWAP", "base": "ETH", "label": f"ETH_{QUOTE_CCY}", "price_round": 2},
@@ -72,8 +73,8 @@ FUTURES_INSTRUMENTS = [
 # =========================================================================
 CONFIG = {
     "ALPHA_MAX_ACTIVE_SLOTS": 3,
-    "MIN_ORDER_VALUE_USDC": 11.0,
-    "RESERVE_CASH_BUFFER_USDC": 3.0,
+    "MIN_ORDER_VALUE_QUOTE": 11.0,
+    "RESERVE_CASH_BUFFER_QUOTE": 3.0,
     "RISK_PER_TRADE_PCT": 0.01,
     "MAX_POSITION_PORTFOLIO_RATIO": 0.18,  # max ~18% portfela na margines izolowany
     "DYNAMIC_RISK": {
@@ -581,21 +582,25 @@ class MarketRegimeArbitrator:
         return "NEUTRAL"
 
 # =========================================================================
-# KLIENT ASYNCHRONICZNY WEBSOCKET DLA EUROPEJSKIEGO KLASTRA EEA
+# KLIENT ASYNCHRONICZNY WEBSOCKET Z FAILOVER I DEDYKOWANYM PINGIEM OKX
 # =========================================================================
 class OKXWebSocketPriceFeed:
     def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = True):
         self.session = session
         self.is_sandbox = is_sandbox
-        # Rynek publiczny cen (tickers) pobieramy z oficjalnego europejskiego strumienia live
-        # Zapewnia to ciagly, plynny strumien tickow rynkowych 24/7 (w Sandboxie brak obrotu na USDC)
-        self.ws_url = "wss://wseea.okx.com:8443/ws/v5/public"
+        # Lista serwerów z automatycznym przełączaniem awaryjnym (Failover)
+        self.ws_endpoints = [
+            "wss://wseea.okx.com:8443/ws/v5/public",
+            "wss://wsaws.okx.com:8443/ws/v5/public",
+            "wss://ws.okx.com:8443/ws/v5/public"
+        ]
+        self.current_ep_index = 0
         self.latest_prices: Dict[str, float] = {}
         self.last_msg_time = time.monotonic()
         self._running: bool = False
 
     async def _ping_worker(self, ws):
-        """Wysyla tekstowy ping co 20 sekund zgodnie ze specyfikacja OKX WebSocket."""
+        """Wysyła tekstowy ping co 20 sekund zgodnie ze specyfikacją OKX WebSocket."""
         try:
             while not ws.closed and self._running:
                 await asyncio.sleep(20)
@@ -612,14 +617,14 @@ class OKXWebSocketPriceFeed:
         subscribe_msg = json.dumps({"op": "subscribe", "args": sub_args})
 
         while self._running and not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
+            ws_url = self.ws_endpoints[self.current_ep_index % len(self.ws_endpoints)]
             try:
-                logger.info(f"🌐 [WS-CONNECT] Laczenie ze strumieniem cen OKX SWAP EEA: {self.ws_url}...")
-                async with self.session.ws_connect(self.ws_url, heartbeat=None) as ws:
+                logger.info(f"🌐 [WS-CONNECT] Łączenie ze strumieniem cen OKX SWAP: {ws_url}...")
+                async with self.session.ws_connect(ws_url, heartbeat=None) as ws:
                     await ws.send_str(subscribe_msg)
-                    logger.info(f"📡 [WS-SUBSCRIBED] Subskrypcja SWAP aktywna dla {symbols}")
+                    logger.info(f"📡 [WS-SUBSCRIBED] Wysłano subskrypcję SWAP dla {symbols}")
                     self.last_msg_time = time.monotonic()
 
-                    # Uruchomienie dedykowanego workera ping-pong dla OKX
                     ping_task = asyncio.create_task(self._ping_worker(ws))
 
                     try:
@@ -627,12 +632,12 @@ class OKXWebSocketPriceFeed:
                             try:
                                 msg = await asyncio.wait_for(ws.receive(), timeout=45.0)
                             except asyncio.TimeoutError:
-                                logger.warning("⚠️ [WS-WATCHDOG] Brak pakietow przez 45s. Resetowanie WebSocket...")
+                                logger.warning("⚠️ [WS-WATCHDOG] Brak pakietów przez 45s. Przełączanie serwera WebSocket...")
+                                self.current_ep_index += 1
                                 break
 
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 self.last_msg_time = time.monotonic()
-                                # Obsluga odpowiedzi pong z serwera OKX
                                 if msg.data == "pong":
                                     continue
 
@@ -641,13 +646,12 @@ class OKXWebSocketPriceFeed:
                                 except Exception:
                                     continue
 
-                                # Logowanie potwierdzenia subskrypcji lub bledu z gieldy
                                 if "event" in data:
                                     ev = data.get("event")
                                     if ev == "subscribe":
-                                        logger.info(f"✅ [OKX-WS-CONFIRMED] Potwierdzono subskrypcje kanalu: {data.get('arg')}")
+                                        logger.info(f"✅ [OKX-WS-CONFIRMED] Potwierdzono kanał: {data.get('arg')}")
                                     elif ev == "error":
-                                        logger.error(f"❌ [OKX-WS-ERROR] Odpowiedz bledu z OKX: {data}")
+                                        logger.error(f"❌ [OKX-WS-ERROR] Odpowiedź błędu z OKX: {data}")
                                     continue
 
                                 if "data" in data and len(data["data"]) > 0:
@@ -658,14 +662,16 @@ class OKXWebSocketPriceFeed:
                                         prev_p = self.latest_prices.get(inst_id)
                                         self.latest_prices[inst_id] = float(last_price)
                                         if prev_p is None:
-                                            logger.info(f"📡 [WS-FEED] Pierwszy kurs SWAP {inst_id}: {last_price} {QUOTE_CCY}")
+                                            logger.info(f"📡 [WS-FEED] Odebrano pierwszy kurs SWAP {inst_id}: {last_price} {QUOTE_CCY}")
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                logger.warning("⚠️ [WS-DISCONNECTED] Gniazdo WebSocket zamkniete. Wznawianie...")
+                                logger.warning("⚠️ [WS-DISCONNECTED] Gniazdo zamknięte. Następny serwer...")
+                                self.current_ep_index += 1
                                 break
                     finally:
                         ping_task.cancel()
             except Exception as e:
-                logger.error(f"❌ [WS-ERROR] Awaria strumienia SWAP: {e}. Wznawianie za 5s...")
+                logger.error(f"❌ [WS-ERROR] Awaria strumienia SWAP ({ws_url}): {e}. Wznawianie za 5s...")
+                self.current_ep_index += 1
                 await asyncio.sleep(5)
 
     def get_last_price(self, symbol: str) -> Optional[float]:
@@ -765,10 +771,12 @@ class OKXFuturesClient:
                         "minSz": float(item.get("minSz", 1.0)),
                         "lotSz": float(item.get("lotSz", 1.0)),
                         "tickSz": float(item.get("tickSz", 0.1)),
-                        "settleCcy": item.get("settleCcy", "USDC")
+                        "settleCcy": item.get("settleCcy", QUOTE_CCY)
                     }
                     self.instruments_cache[symbol] = spec
+                    logger.info(f"📋 [SPEC-LOADED] {symbol} | ctVal: {spec['ctVal']} {spec['ctValCcy']} | minSz: {spec['minSz']} | lotSz: {spec['lotSz']}")
                     return spec
+                logger.warning(f"⚠️ [SPEC-FAILED] Brak specyfikacji dla {symbol}: {data}")
                 return None
         except Exception as e:
             logger.error(f"[FUTURES-SPEC] Błąd specyfikacji {symbol}: {e}")
@@ -790,12 +798,12 @@ class OKXFuturesClient:
             logger.error(f"[FUTURES-LEVERAGE] Błąd lewaru {symbol} [{pos_side}]: {e}")
             return False
 
-    async def get_wallet_balances(self, ccy: str = "USDC") -> Dict[str, float]:
-        """Pobiera kapitał i wolny depozyt zabezpieczający w USDC."""
+    async def get_wallet_balances(self, preferred_ccy: str = "USDT") -> Dict[str, Any]:
+        """Pobiera kapitał i wolny depozyt, obsługując automatycznie USDT oraz USDC."""
         if not self.api_key or not self.secret_key or not self.passphrase:
-            return {"total_equity": 0.0, "available_cash": 0.0}
+            return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}}
         await self.rate_limiter.consume()
-        request_path = f"/api/v5/account/balance?ccy={ccy}"
+        request_path = "/api/v5/account/balance"
         url = f"{self.base_url}{request_path}"
         headers = self._get_headers("GET", request_path)
         try:
@@ -804,25 +812,42 @@ class OKXFuturesClient:
                 if data.get("code") == "0" and data.get("data"):
                     acc = data["data"][0]
                     total_eq = float(acc.get("totalEq", 0.0))
-                    avail_cash = 0.0
+                    balances_map = {}
                     for b in acc.get("details", []):
-                        if b.get("ccy") == ccy:
-                            avail_cash = float(b.get("availBal", 0.0))
-                            break
-                    return {"total_equity": total_eq, "available_cash": avail_cash}
-                return {"total_equity": 0.0, "available_cash": 0.0}
+                        c = b.get("ccy", "")
+                        balances_map[c] = {
+                            "availBal": float(b.get("availBal", 0.0)),
+                            "eq": float(b.get("eq", 0.0))
+                        }
+                    
+                    # Sprawdzenie dostępnej gotówki dla preferowanej waluty (USDT), fallback na USDC
+                    avail_cash = 0.0
+                    if preferred_ccy in balances_map:
+                        avail_cash = balances_map[preferred_ccy]["availBal"]
+                    elif "USDT" in balances_map and balances_map["USDT"]["availBal"] > 0:
+                        avail_cash = balances_map["USDT"]["availBal"]
+                    elif "USDC" in balances_map and balances_map["USDC"]["availBal"] > 0:
+                        avail_cash = balances_map["USDC"]["availBal"]
+                    
+                    return {
+                        "total_equity": total_eq,
+                        "available_cash": avail_cash,
+                        "preferred_ccy": preferred_ccy,
+                        "balances": balances_map
+                    }
+                return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}}
         except Exception as e:
             logger.error(f"❌ [OKX-WALLET] Błąd salda: {e}")
-            return {"total_equity": 0.0, "available_cash": 0.0}
+            return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}}
 
     def calculate_contract_size(
         self,
         symbol: str,
         current_price: float,
-        target_margin_usdc: float,
+        target_margin_quote: float,
         max_allowed_margin: float
     ) -> Tuple[int, float]:
-        """Przelicza zaplanowany margines USDC na liczbę kontraktów całkowitych sz."""
+        """Przelicza zaplanowany margines na liczbę kontraktów całkowitych sz."""
         spec = self.instruments_cache.get(symbol)
         if not spec or current_price <= 0:
             return 0, 0.0
@@ -831,16 +856,15 @@ class OKXFuturesClient:
         min_sz = int(spec["minSz"])
         lot_sz = int(spec["lotSz"])
 
-        contract_nominal_usdc = ct_val * current_price
-        single_contract_margin = contract_nominal_usdc / self.TARGET_LEVERAGE
+        contract_nominal_quote = ct_val * current_price
+        single_contract_margin = contract_nominal_quote / self.TARGET_LEVERAGE
 
-        # Twardy bezpiecznik: Blokada jeśli 1 min-kontrakt przekracza dopuszczalny limit
         if (min_sz * single_contract_margin) > max_allowed_margin:
-            logger.warning(f"🛡️ [SIZING-REJECTED] {symbol}: 1 lot wymaga {round(min_sz * single_contract_margin, 2)} USDC > limit {round(max_allowed_margin, 2)} USDC.")
+            logger.warning(f"🛡️ [SIZING-REJECTED] {symbol}: 1 lot wymaga {round(min_sz * single_contract_margin, 2)} {QUOTE_CCY} > limit {round(max_allowed_margin, 2)} {QUOTE_CCY}.")
             return 0, 0.0
 
-        target_nominal = target_margin_usdc * self.TARGET_LEVERAGE
-        raw_contracts = target_nominal / contract_nominal_usdc
+        target_nominal = target_margin_quote * self.TARGET_LEVERAGE
+        raw_contracts = target_nominal / contract_nominal_quote
         contracts = math.floor(raw_contracts / lot_sz) * lot_sz
 
         if contracts < min_sz:
@@ -849,7 +873,7 @@ class OKXFuturesClient:
             else:
                 return 0, 0.0
 
-        actual_margin = (contracts * contract_nominal_usdc) / self.TARGET_LEVERAGE
+        actual_margin = (contracts * contract_nominal_quote) / self.TARGET_LEVERAGE
         return int(contracts), round(actual_margin, 2)
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -1077,7 +1101,7 @@ async def reconcile_and_timestop_futures(
                 else: # short
                     pnl_gross = (entry_p - exit_p) * contracts * ct_val
 
-                margin_locked = float(pos_data.get("margin_usdc", 1.0))
+                margin_locked = float(pos_data.get("margin_locked", 1.0))
                 pnl_net = round(pnl_gross - (margin_locked * 0.001), 2)
                 roe_net = round((pnl_net / margin_locked) * 100.0, 2) if margin_locked > 0 else 0.0
 
@@ -1087,7 +1111,7 @@ async def reconcile_and_timestop_futures(
                     f"──────────────────────────────\n"
                     f"📈 Strategia: <b>{strategy_type}</b> [{pos_side.upper()}]\n"
                     f"💰 Wyjście: <b>{exit_p} {QUOTE_CCY}</b> (Wejście: {entry_p} {QUOTE_CCY})\n"
-                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: {margin_locked} USDC 3x)\n"
+                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: {margin_locked} {QUOTE_CCY} 3x)\n"
                     f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY} ({roe_net}%)</b>\n"
                     f"Slot ALFA zwolniony."
                 )
@@ -1159,7 +1183,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                         total_balance = wallet.get("total_equity", 0.0)
                         available_cash = wallet.get("available_cash", 0.0)
 
-                        if available_cash < CONFIG["MIN_ORDER_VALUE_USDC"]:
+                        if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
                             continue
 
                         price_sl, price_tp, sl_pct = calculate_clamped_sl_tp(
@@ -1171,7 +1195,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                         )
 
                         risk_capital = total_balance * CONFIG["RISK_PER_TRADE_PCT"]
-                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_USDC"])
+                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
                         target_margin = min(risk_capital / sl_pct, total_balance * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
 
                         contracts, actual_margin = inst["client"].calculate_contract_size(
@@ -1180,7 +1204,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                         if contracts < 1 or actual_margin > available_cash:
                             continue
 
-                        logger.info(f"🚨 [MEAN-REV-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] | Kontrakty: {contracts} | Margines: {actual_margin} USDC")
+                        logger.info(f"🚨 [MEAN-REV-TRIGGER] Otwarcie SWAP {inst['label']} [{pos_side.upper()}] | Kontrakty: {contracts} | Margines: {actual_margin} {QUOTE_CCY}")
                         order_res = await inst["client"].execute_futures_order(
                             inst["symbol"], side=order_side, pos_side=pos_side, quantity=contracts, ord_type="market"
                         )
@@ -1197,7 +1221,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                                     "algo_id": algo_id,
                                     "contracts": contracts,
                                     "pos_side": pos_side,
-                                    "margin_usdc": actual_margin,
+                                    "margin_locked": actual_margin,
                                     "entry_price": current_price,
                                     "tp_price": price_tp,
                                     "sl_price": price_sl,
@@ -1209,7 +1233,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                                     f"──────────────────────────────\n"
                                     f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
                                     f"💰 Kurs wejścia: <b>{current_price} {QUOTE_CCY}</b>\n"
-                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} USDC)\n"
+                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
                                     f"Strażnik Czasu: 8h | OCO: AKTYWNE"
@@ -1279,7 +1303,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                         total_balance = wallet.get("total_equity", 0.0)
                         available_cash = wallet.get("available_cash", 0.0)
 
-                        if available_cash < CONFIG["MIN_ORDER_VALUE_USDC"]:
+                        if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
                             continue
 
                         price_sl, price_tp, sl_pct = calculate_clamped_sl_tp(
@@ -1291,7 +1315,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                         )
 
                         risk_capital = total_balance * CONFIG["RISK_PER_TRADE_PCT"]
-                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_USDC"])
+                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
                         target_margin = min(risk_capital / sl_pct, total_balance * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
 
                         contracts, actual_margin = inst["client"].calculate_contract_size(
@@ -1317,7 +1341,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                                     "algo_id": algo_id,
                                     "contracts": contracts,
                                     "pos_side": pos_side,
-                                    "margin_usdc": actual_margin,
+                                    "margin_locked": actual_margin,
                                     "entry_price": current_price,
                                     "tp_price": price_tp,
                                     "sl_price": price_sl,
@@ -1329,7 +1353,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                                     f"──────────────────────────────\n"
                                     f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
                                     f"💰 Kurs: <b>{current_price} {QUOTE_CCY}</b> (ROC: {mom['roc']}%)\n"
-                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} USDC)\n"
+                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
                                     f"Strażnik Czasu: 6h | OCO: AKTYWNE"
@@ -1394,7 +1418,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                         total_balance = wallet.get("total_equity", 0.0)
                         available_cash = wallet.get("available_cash", 0.0)
 
-                        if available_cash < CONFIG["MIN_ORDER_VALUE_USDC"]:
+                        if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
                             continue
 
                         price_sl, price_tp, sl_pct = calculate_clamped_sl_tp(
@@ -1406,7 +1430,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                         )
 
                         risk_capital = total_balance * CONFIG["RISK_PER_TRADE_PCT"]
-                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_USDC"])
+                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
                         target_margin = min(risk_capital / sl_pct, total_balance * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
 
                         contracts, actual_margin = inst["client"].calculate_contract_size(
@@ -1432,7 +1456,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                     "algo_id": algo_id,
                                     "contracts": contracts,
                                     "pos_side": pos_side,
-                                    "margin_usdc": actual_margin,
+                                    "margin_locked": actual_margin,
                                     "entry_price": current_price,
                                     "tp_price": price_tp,
                                     "sl_price": price_sl,
@@ -1444,7 +1468,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                     f"──────────────────────────────\n"
                                     f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
                                     f"💰 Kurs: <b>{current_price} {QUOTE_CCY}</b> (Banda: {brk['upper_band'] if pos_side == 'long' else brk['lower_band']})\n"
-                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} USDC)\n"
+                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
                                     f"Strażnik Czasu: 6h | OCO: AKTYWNE"
@@ -1509,7 +1533,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                         total_balance = wallet.get("total_equity", 0.0)
                         available_cash = wallet.get("available_cash", 0.0)
 
-                        if available_cash < CONFIG["MIN_ORDER_VALUE_USDC"]:
+                        if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
                             continue
 
                         price_sl, price_tp, sl_pct = calculate_clamped_sl_tp(
@@ -1521,7 +1545,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                         )
 
                         risk_capital = total_balance * CONFIG["RISK_PER_TRADE_PCT"]
-                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_USDC"])
+                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
                         target_margin = min(risk_capital / sl_pct, total_balance * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
 
                         contracts, actual_margin = inst["client"].calculate_contract_size(
@@ -1547,7 +1571,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                                     "algo_id": algo_id,
                                     "contracts": contracts,
                                     "pos_side": pos_side,
-                                    "margin_usdc": actual_margin,
+                                    "margin_locked": actual_margin,
                                     "entry_price": current_price,
                                     "tp_price": price_tp,
                                     "sl_price": price_sl,
@@ -1559,7 +1583,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                                     f"──────────────────────────────\n"
                                     f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
                                     f"💰 Kurs: <b>{current_price} {QUOTE_CCY}</b> (EMA-20: {pb['ema_20']})\n"
-                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} USDC)\n"
+                                    f"📦 Kontrakty: <b>{contracts} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
                                     f"Strażnik Czasu: 6h | OCO: AKTYWNE"
@@ -1678,6 +1702,7 @@ def web_test_futures_environment():
                     "symbol": sym,
                     "spec_loaded": spec is not None,
                     "ct_val": spec["ctVal"] if spec else None,
+                    "settle_ccy": spec["settleCcy"] if spec else None,
                     "current_price": ticker["last"] if ticker else 0.0,
                     "leverage_3x_locked": (lev_l and lev_s)
                 })
@@ -1685,10 +1710,11 @@ def web_test_futures_environment():
             return {
                 "system": "OKX_FUTURES_3X_MULTI_AGENT_ENGINE",
                 "mode": "SANDBOX (DEMO)" if IS_SANDBOX else "LIVE_SUBACCOUNT",
+                "quote_ccy": QUOTE_CCY,
                 "redis_connected": redis_pong,
                 "redis_prefix": redis_bridge.prefix,
                 "okx_auth": auth_status,
-                "futures_balance_usdc": balance,
+                "futures_balance": balance,
                 "instruments": instruments_report
             }
 
@@ -1704,7 +1730,7 @@ def web_test_futures_environment():
 
 @app.route('/emergency-liquidate', methods=['GET', 'POST'])
 def emergency_liquidate_to_cash():
-    """Awaryjne odwołanie wszystkich zleceń, rynkowy zrzut kontraktów do USDC (reduceOnly) i czyszczenie Redis."""
+    """Awaryjne odwołanie wszystkich zleceń, rynkowy zrzut kontraktów (reduceOnly) i czyszczenie Redis."""
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
         return jsonify({"status": "error", "message": "Pętla bota nie jest aktywna."}), 500
 
