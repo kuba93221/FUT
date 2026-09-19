@@ -930,15 +930,19 @@ class OKXFuturesClient:
                             "eq": float(b.get("eq", 0.0))
                         }
 
+                    # STREAMING CHUNK: Priorytetyzowanie waluty zabezpieczenia USDC pod rynek X-Perp...
                     avail_cash = 0.0
-                    if preferred_ccy in balances_map and balances_map[preferred_ccy]["availBal"] > 0:
+                    # Dla kontraktów USD-Margined (X-Perp) na koncie OKX natywnym zabezpieczeniem jest USDC:
+                    if preferred_ccy in ("USD", "USDC") and "USDC" in balances_map and balances_map["USDC"]["availBal"] > 0:
+                        avail_cash = balances_map["USDC"]["availBal"]
+                    elif preferred_ccy in balances_map and balances_map[preferred_ccy]["availBal"] > 0:
                         avail_cash = balances_map[preferred_ccy]["availBal"]
-                    elif "USDT" in balances_map and balances_map["USDT"]["availBal"] > 0:
-                        avail_cash = balances_map["USDT"]["availBal"]
                     elif "USDC" in balances_map and balances_map["USDC"]["availBal"] > 0:
                         avail_cash = balances_map["USDC"]["availBal"]
                     elif "USD" in balances_map and balances_map["USD"]["availBal"] > 0:
                         avail_cash = balances_map["USD"]["availBal"]
+                    elif "USDT" in balances_map and balances_map["USDT"]["availBal"] > 0:
+                        avail_cash = balances_map["USDT"]["availBal"]
 
                     return {
                         "total_equity": total_eq,
@@ -1072,8 +1076,16 @@ class OKXFuturesClient:
         try:
             async with self.session.post(url, data=body_json, headers=headers, timeout=5) as r:
                 res_json = await r.json()
+                # STREAMING CHUNK: Ekstrakcja szczegółowych komunikatów błędów sCode/sMsg z OKX...
                 if res_json.get("code") != "0":
-                    logger.error(f"❌ [OKX-ORDER-REJECTED] {symbol} [{pos_side}]: {res_json.get('msg')} (kod: {res_json.get('code')})")
+                    err_msg = res_json.get('msg', 'Nieznany błąd')
+                    data_list = res_json.get('data', [])
+                    if data_list and isinstance(data_list, list) and len(data_list) > 0:
+                        sub_msg = data_list[0].get('sMsg')
+                        sub_code = data_list[0].get('sCode')
+                        if sub_msg:
+                            err_msg = f"{err_msg} [{sub_code}: {sub_msg}]"
+                    logger.error(f"❌ [OKX-ORDER-REJECTED] {symbol} [{pos_side}]: {err_msg} (kod: {res_json.get('code')})")
                 return res_json
         except Exception as e:
             logger.error(f"❌ [OKX-ORDER-ERROR] Zlecenie {symbol} [{pos_side}]: {e}")
