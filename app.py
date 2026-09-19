@@ -1185,6 +1185,30 @@ class OKXFuturesClient:
             logger.error(f"[PENDING-CHECK-ERROR] Błąd sprawdzania oczekujących zleceń {symbol}: {e}")
             return False
 
+    async def get_last_closed_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Pobiera z giełdy rzeczywiste dane ostatnio zamkniętej pozycji (cena wyjścia, zrealizowany PnL)."""
+        if not self.api_key or not self.secret_key or not self.passphrase:
+            return None
+        await self.rate_limiter.consume()
+        request_path = f"/api/v5/account/positions-history?instType=FUTURES&instId={symbol}&limit=1"
+        url = f"{self.base_url}{request_path}"
+        headers = self._get_headers("GET", request_path)
+        try:
+            async with self.session.get(url, headers=headers, timeout=5) as resp:
+                data = await resp.json()
+                if data.get("code") == "0" and data.get("data") and len(data["data"]) > 0:
+                    p = data["data"][0]
+                    return {
+                        "close_avg_px": float(p.get("closeAvgPx", 0.0)),
+                        "realized_pnl": float(p.get("realizedPnl", 0.0)),
+                        "pnl_ratio": float(p.get("pnlRatio", 0.0)) * 100.0,
+                        "fee": float(p.get("fee", 0.0))
+                    }
+                return None
+        except Exception as e:
+            logger.error(f"[POS-HISTORY-ERROR] Błąd pobierania historii pozycji {symbol}: {e}")
+            return None
+
     async def get_algo_order_state(self, algo_id: str) -> Tuple[Optional[str], Optional[float]]:
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None, None
@@ -1245,21 +1269,30 @@ async def reconcile_and_timestop_futures(
             await redis_trade.delete_key(pos_key)
 
             entry_p = float(pos_data.get("entry_price", 0.0))
-            tp_p = float(pos_data.get("tp_price", entry_p))
-            sl_p = float(pos_data.get("sl_price", entry_p))
-            exit_p = actual_px if actual_px and actual_px > 0 else (tp_p if pos_side == "long" else sl_p)
-
-            spec = inst["client"].instruments_cache.get(inst["symbol"], {"ctVal": 1.0})
-            ct_val = spec["ctVal"]
-
-            if pos_side == "long":
-                pnl_gross = (exit_p - entry_p) * contracts * ct_val
-            else: # short
-                pnl_gross = (entry_p - exit_p) * contracts * ct_val
-
             margin_locked = float(pos_data.get("margin_locked", 1.0))
-            pnl_net = round(pnl_gross - (margin_locked * 0.001), 2)
-            roe_net = round((pnl_net / margin_locked) * 100.0, 2) if margin_locked > 0 else 0.0
+
+            # POBIERAMY PRAWDZIWE DANE ROZLICZENIOWE BEZPOŚREDNIO Z OKX:
+            real_pos_history = await inst["client"].get_last_closed_position(inst["symbol"])
+            if real_pos_history and real_pos_history.get("close_avg_px", 0.0) > 0.0:
+                exit_p = real_pos_history["close_avg_px"]
+                pnl_net = round(real_pos_history["realized_pnl"], 2)
+                roe_net = round(real_pos_history["pnl_ratio"], 2)
+            else:
+                # Awaryjny fallback na wypadek opóźnienia w indeksowaniu historii giełdy
+                tp_p = float(pos_data.get("tp_price", entry_p))
+                sl_p = float(pos_data.get("sl_price", entry_p))
+                exit_p = actual_px if actual_px and actual_px > 0 else (sl_p if pos_side == "long" else tp_p)
+
+                spec = inst["client"].instruments_cache.get(inst["symbol"], {"ctVal": 1.0})
+                ct_val = spec["ctVal"]
+
+                if pos_side == "long":
+                    pnl_gross = (exit_p - entry_p) * contracts * ct_val
+                else: # short
+                    pnl_gross = (entry_p - exit_p) * contracts * ct_val
+
+                pnl_net = round(pnl_gross - (margin_locked * 0.001), 2)
+                roe_net = round((pnl_net / margin_locked) * 100.0, 2) if margin_locked > 0 else 0.0
 
             icon = "🎉 <b>[ZYSK TAKE PROFIT]" if pnl_net >= 0 else "🛑 <b>[STOP LOSS / WYJŚCIE]"
             await tg.push(
