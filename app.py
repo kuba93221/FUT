@@ -1167,6 +1167,24 @@ class OKXFuturesClient:
             logger.error(f"[OKX-POS-CHECK] Błąd sprawdzania pozycji {symbol}: {e}")
             return 0.0
 
+    async def has_pending_orders(self, symbol: str) -> bool:
+        """Sprawdza, czy na danym instrumencie wiszą jakiekolwiek niewypełnione zlecenia w kolejce."""
+        if not self.api_key or not self.secret_key or not self.passphrase:
+            return False
+        await self.rate_limiter.consume()
+        request_path = f"/api/v5/trade/orders-pending?instType=FUTURES&instId={symbol}"
+        url = f"{self.base_url}{request_path}"
+        headers = self._get_headers("GET", request_path)
+        try:
+            async with self.session.get(url, headers=headers, timeout=5) as resp:
+                data = await resp.json()
+                if data.get("code") == "0" and data.get("data"):
+                    return len(data["data"]) > 0
+                return False
+        except Exception as e:
+            logger.error(f"[PENDING-CHECK-ERROR] Błąd sprawdzania oczekujących zleceń {symbol}: {e}")
+            return False
+
     async def get_algo_order_state(self, algo_id: str) -> Tuple[Optional[str], Optional[float]]:
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None, None
@@ -1215,11 +1233,14 @@ async def reconcile_and_timestop_futures(
         elapsed_time = time.time() - opened_at
         max_timeout = CONFIG["TIMEOUTS"].get(strategy_type, 28800)
 
-        # 1. Pozycja zamknięta na giełdzie przez TP/SL (pos=0) LUB zlecenie OCO weszło w stan terminalny/aktywny
-        is_closed_on_exchange = (actual_pos_on_exchange == 0.0)
-        is_algo_terminal = algo_state in ["filled", "effective", "canceled", "order_failed"]
+        # 1. Pozycja faktycznie zamknięta przez rynek (realizacja zlecenia OCO przez TP lub SL)
+        # UWAGA: Warunek actual_pos == 0.0 uruchamiamy TYLKO wtedy, gdy OCO faktycznie weszło w stan realizacji (effective/filled)
+        # LUB gdy OCO zostało anulowane, a pozycja fizycznie wynosi 0 (zamknięcie ręczne).
+        # Zapobiega to zgłaszaniu fałszywych zysków, gdy zlecenie wejściowe wciąż czeka w kolejce giełdy!
+        is_algo_executed = algo_state in ["effective", "filled"]
+        is_algo_aborted = algo_state in ["canceled", "order_failed"]
 
-        if is_closed_on_exchange or is_algo_terminal:
+        if is_algo_executed or (is_algo_aborted and actual_pos_on_exchange == 0.0):
             logger.info(f"🧹 [FUTURES-RECONCILE] Pozycja {inst['label']} zakończona na giełdzie (pos={actual_pos_on_exchange}, algo={algo_state}). Zwalnianie slotu...")
             await redis_trade.delete_key(pos_key)
 
@@ -1306,6 +1327,11 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                 pos_check = await redis_trade.get_position_state(pos_key)
                 if pos_check and pos_check.get("status") in ["OPEN", "WAITING_OCO"]:
+                    continue
+
+                # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
+                has_pending = await inst["client"].has_pending_orders(inst["symbol"])
+                if has_pending:
                     continue
 
                 ticker = await inst["client"].get_market_ticker(inst["symbol"])
@@ -1457,6 +1483,11 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                 if pos_check and pos_check.get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
 
+                # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
+                has_pending = await inst["client"].has_pending_orders(inst["symbol"])
+                if has_pending:
+                    continue
+
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
                 if not candles_raw:
                     continue
@@ -1594,6 +1625,11 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                 if pos_check and pos_check.get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
 
+                # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
+                has_pending = await inst["client"].has_pending_orders(inst["symbol"])
+                if has_pending:
+                    continue
+
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
                 if not candles_raw:
                     continue
@@ -1725,6 +1761,11 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                 pos_check = await redis_trade.get_position_state(pos_key)
                 if pos_check and pos_check.get("status") in ["OPEN", "WAITING_OCO"]:
+                    continue
+
+                # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
+                has_pending = await inst["client"].has_pending_orders(inst["symbol"])
+                if has_pending:
                     continue
 
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
