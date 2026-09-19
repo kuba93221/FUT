@@ -671,8 +671,7 @@ class OKXWebSocketPriceFeed:
         self.is_sandbox = is_sandbox
         self.ws_endpoints = [
             "wss://wseeapap.okx.com:8443/ws/v5/public" if is_sandbox else "wss://wseea.okx.com:8443/ws/v5/public",
-            "wss://wsaws.okx.com:8443/ws/v5/public",
-            "wss://ws.okx.com:8443/ws/v5/public"
+            "wss://wspap.okx.com:8443/ws/v5/public" if is_sandbox else "wss://ws.okx.com:8443/ws/v5/public"
         ]
         self.current_ep_index = 0
         self.latest_prices: Dict[str, float] = {}
@@ -1136,6 +1135,26 @@ class OKXFuturesClient:
             logger.error(f"❌ [OKX-CANCEL-ALGO] Błąd anulowania OCO {algo_id}: {e}")
             return False
 
+    async def get_open_position_size(self, symbol: str, pos_side: str) -> float:
+        """Sprawdza na giełdzie faktyczną wielkość otwartej pozycji (kontrakty)."""
+        if not self.api_key or not self.secret_key or not self.passphrase:
+            return 0.0
+        await self.rate_limiter.consume()
+        request_path = f"/api/v5/account/positions?instType=FUTURES&instId={symbol}"
+        url = f"{self.base_url}{request_path}"
+        headers = self._get_headers("GET", request_path)
+        try:
+            async with self.session.get(url, headers=headers, timeout=5) as resp:
+                data = await resp.json()
+                if data.get("code") == "0" and data.get("data"):
+                    for p in data["data"]:
+                        if p.get("posSide", "").lower() == pos_side.lower():
+                            return float(p.get("pos", 0.0))
+                return 0.0
+        except Exception as e:
+            logger.error(f"[OKX-POS-CHECK] Błąd sprawdzania pozycji {symbol}: {e}")
+            return 0.0
+
     async def get_algo_order_state(self, algo_id: str) -> Tuple[Optional[str], Optional[float]]:
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None, None
@@ -1165,7 +1184,7 @@ async def reconcile_and_timestop_futures(
     redis_trade: UpstashRedisFuturesBridge,
     tg: TelegramThrottledDispatcher
 ) -> Tuple[bool, Optional[str]]:
-    """Uniwersalny strażnik czasu pozycji lewarowanych LONG i SHORT."""
+    """Uniwersalny strażnik czasu pozycji z natychmiastową reconciliacją z giełdą oraz Time-Stop."""
     pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
     pos_data = await redis_trade.get_position_state(pos_key)
     if not pos_data:
@@ -1175,14 +1194,54 @@ async def reconcile_and_timestop_futures(
         algo_id = pos_data["algo_id"]
         pos_side = pos_data.get("pos_side", "long")
         contracts = float(pos_data.get("contracts", 0.01))
+
+        # Bezpośrednia weryfikacja na giełdzie: czy pozycja fizycznie istnieje?
+        actual_pos_on_exchange = await inst["client"].get_open_position_size(inst["symbol"], pos_side)
         algo_state, actual_px = await inst["client"].get_algo_order_state(algo_id)
 
         opened_at = float(pos_data.get("time", time.time()))
         elapsed_time = time.time() - opened_at
         max_timeout = CONFIG["TIMEOUTS"].get(strategy_type, 28800)
 
-        # 1. Dual Time-Stop Interwencja
-        if algo_state not in ["filled", "canceled", "order_failed"] and elapsed_time > max_timeout:
+        # 1. Pozycja zamknięta na giełdzie przez TP/SL (pos=0) LUB zlecenie OCO weszło w stan terminalny/aktywny
+        is_closed_on_exchange = (actual_pos_on_exchange == 0.0)
+        is_algo_terminal = algo_state in ["filled", "effective", "canceled", "order_failed"]
+
+        if is_closed_on_exchange or is_algo_terminal:
+            logger.info(f"🧹 [FUTURES-RECONCILE] Pozycja {inst['label']} zakończona na giełdzie (pos={actual_pos_on_exchange}, algo={algo_state}). Zwalnianie slotu...")
+            await redis_trade.delete_key(pos_key)
+
+            entry_p = float(pos_data.get("entry_price", 0.0))
+            tp_p = float(pos_data.get("tp_price", entry_p))
+            sl_p = float(pos_data.get("sl_price", entry_p))
+            exit_p = actual_px if actual_px and actual_px > 0 else (tp_p if pos_side == "long" else sl_p)
+
+            spec = inst["client"].instruments_cache.get(inst["symbol"], {"ctVal": 1.0})
+            ct_val = spec["ctVal"]
+
+            if pos_side == "long":
+                pnl_gross = (exit_p - entry_p) * contracts * ct_val
+            else: # short
+                pnl_gross = (entry_p - exit_p) * contracts * ct_val
+
+            margin_locked = float(pos_data.get("margin_locked", 1.0))
+            pnl_net = round(pnl_gross - (margin_locked * 0.001), 2)
+            roe_net = round((pnl_net / margin_locked) * 100.0, 2) if margin_locked > 0 else 0.0
+
+            icon = "🎉 <b>[ZYSK TAKE PROFIT]" if pnl_net >= 0 else "🛑 <b>[STOP LOSS / WYJŚCIE]"
+            await tg.push(
+                f"{icon} • {inst['label']}</b>\n"
+                f"──────────────────────────────\n"
+                f"📈 Strategia: <b>{strategy_type}</b> [{pos_side.upper()}]\n"
+                f"💰 Wyjście: <b>{exit_p} {QUOTE_CCY}</b> (Wejście: {entry_p} {QUOTE_CCY})\n"
+                f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: {margin_locked} {QUOTE_CCY} 3x)\n"
+                f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY} ({roe_net}%)</b>\n"
+                f"Slot ALFA zwolniony natychmiast."
+            )
+            return True, pos_key
+
+        # 2. Dual Time-Stop Interwencja (uruchamiana tylko gdy pozycja faktycznie nadal wisi na giełdzie)
+        if elapsed_time > max_timeout:
             logger.warning(f"⏳ [TIME-STOP] Pozycja {inst['label']} ({strategy_type} [{pos_side}]) przekroczyła {round(max_timeout/3600, 1)}h. Awaryjna likwidacja...")
             await inst["client"].cancel_algo_order(inst["symbol"], algo_id)
             await asyncio.sleep(0.3)
@@ -1207,41 +1266,6 @@ async def reconcile_and_timestop_futures(
                 f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Lewar: 3x)\n"
                 f"Pozycja zlikwidowana rynkowo z reduceOnly. Slot uwolniony."
             )
-            return True, pos_key
-
-        # 2. Zrealizowane wyjście (TP lub SL)
-        if algo_state in ["filled", "canceled", "order_failed"]:
-            logger.info(f"🧹 [FUTURES-RECONCILE] Zlecenie Algo dla {inst['label']} zakończone ({algo_state}).")
-            await redis_trade.delete_key(pos_key)
-
-            if algo_state == "filled":
-                entry_p = float(pos_data.get("entry_price", 0.0))
-                tp_p = float(pos_data.get("tp_price", entry_p))
-                sl_p = float(pos_data.get("sl_price", entry_p))
-                exit_p = actual_px if actual_px and actual_px > 0 else (tp_p if pos_side == "long" else sl_p)
-
-                spec = inst["client"].instruments_cache.get(inst["symbol"], {"ctVal": 1.0})
-                ct_val = spec["ctVal"]
-
-                if pos_side == "long":
-                    pnl_gross = (exit_p - entry_p) * contracts * ct_val
-                else: # short
-                    pnl_gross = (entry_p - exit_p) * contracts * ct_val
-
-                margin_locked = float(pos_data.get("margin_locked", 1.0))
-                pnl_net = round(pnl_gross - (margin_locked * 0.001), 2)
-                roe_net = round((pnl_net / margin_locked) * 100.0, 2) if margin_locked > 0 else 0.0
-
-                icon = "🎉 <b>[ZYSK TAKE PROFIT]" if pnl_net >= 0 else "🛑 <b>[STOP LOSS]"
-                await tg.push(
-                    f"{icon} • {inst['label']}</b>\n"
-                    f"──────────────────────────────\n"
-                    f"📈 Strategia: <b>{strategy_type}</b> [{pos_side.upper()}]\n"
-                    f"💰 Wyjście: <b>{exit_p} {QUOTE_CCY}</b> (Wejście: {entry_p} {QUOTE_CCY})\n"
-                    f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: {margin_locked} {QUOTE_CCY} 3x)\n"
-                    f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY} ({roe_net}%)</b>\n"
-                    f"Slot ALFA zwolniony."
-                )
             return True, pos_key
 
     return False, None
@@ -1358,6 +1382,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                                 algo_id = oco_res["data"][0].get("algoId", "")
                                 await redis_trade.set_position_state(pos_key, {
                                     "status": "WAITING_OCO",
+                                    "inst_id": inst["symbol"],
                                     "algo_id": algo_id,
                                     "contracts": contracts,
                                     "pos_side": pos_side,
@@ -1495,6 +1520,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                                 algo_id = oco_res["data"][0].get("algoId", "")
                                 await redis_trade.set_position_state(pos_key, {
                                     "status": "WAITING_OCO",
+                                    "inst_id": inst["symbol"],
                                     "algo_id": algo_id,
                                     "contracts": contracts,
                                     "pos_side": pos_side,
@@ -1627,6 +1653,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                 algo_id = oco_res["data"][0].get("algoId", "")
                                 await redis_trade.set_position_state(pos_key, {
                                     "status": "WAITING_OCO",
+                                    "inst_id": inst["symbol"],
                                     "algo_id": algo_id,
                                     "contracts": contracts,
                                     "pos_side": pos_side,
@@ -1759,6 +1786,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                                 algo_id = oco_res["data"][0].get("algoId", "")
                                 await redis_trade.set_position_state(pos_key, {
                                     "status": "WAITING_OCO",
+                                    "inst_id": inst["symbol"],
                                     "algo_id": algo_id,
                                     "contracts": contracts,
                                     "pos_side": pos_side,
@@ -1972,7 +2000,16 @@ def emergency_liquidate_to_cash():
                     for p_key in all_pos_keys:
                         raw_data = await redis_trade.get_position_state(p_key.replace(redis_trade.prefix, ""))
                         if raw_data:
-                            sym = raw_data.get("inst_id") or f"{p_key.split(':')[-1].split('_')[0]}-{QUOTE_CCY}-SWAP"
+                            sym = raw_data.get("inst_id")
+                            if not sym:
+                                label_prefix = p_key.split(':')[-1].split('_')[0]
+                                for fi in FUTURES_INSTRUMENTS:
+                                    if fi["base"] == label_prefix:
+                                        sym = fi["symbol"]
+                                        break
+                            if not sym:
+                                sym = FUTURES_INSTRUMENTS[0]["symbol"]
+
                             pos_side = raw_data.get("pos_side", "long")
                             contracts = float(raw_data.get("contracts", 0.01))
                             exit_side = "sell" if pos_side == "long" else "buy"
