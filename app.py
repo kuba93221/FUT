@@ -1342,6 +1342,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
         {
             "client": okx_client,
             "symbol": item["symbol"],
+            "base": item["base"],
             "label": f"{item['label']}_MR",
             "price_round": item["price_round"]
         }
@@ -1401,6 +1402,17 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                             active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
 
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
+                            continue
+
+                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety (np. 2x BTC) przez różne strategie
+                        is_coin_already_open = False
+                        for ak in active_keys:
+                            clean_ak = ak.replace(redis_trade.prefix, "")
+                            existing_pos = await redis_trade.get_position_state(clean_ak)
+                            if existing_pos and (existing_pos.get("inst_id") == inst["symbol"] or inst["base"] in clean_ak):
+                                is_coin_already_open = True
+                                break
+                        if is_coin_already_open:
                             continue
 
                         wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
@@ -1496,6 +1508,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
         {
             "client": okx_client,
             "symbol": item["symbol"],
+            "base": item["base"],
             "label": f"{item['label']}_MOM",
             "price_round": item["price_round"]
         }
@@ -1544,6 +1557,17 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                             active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
 
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
+                            continue
+
+                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety przez różne strategie
+                        is_coin_already_open = False
+                        for ak in active_keys:
+                            clean_ak = ak.replace(redis_trade.prefix, "")
+                            existing_pos = await redis_trade.get_position_state(clean_ak)
+                            if existing_pos and (existing_pos.get("inst_id") == inst["symbol"] or inst["base"] in clean_ak):
+                                is_coin_already_open = True
+                                break
+                        if is_coin_already_open:
                             continue
 
                         wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
@@ -1638,6 +1662,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
         {
             "client": okx_client,
             "symbol": item["symbol"],
+            "base": item["base"],
             "label": f"{item['label']}_BRK",
             "price_round": item["price_round"]
         }
@@ -1682,6 +1707,17 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                             active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
 
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
+                            continue
+
+                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety przez różne strategie
+                        is_coin_already_open = False
+                        for ak in active_keys:
+                            clean_ak = ak.replace(redis_trade.prefix, "")
+                            existing_pos = await redis_trade.get_position_state(clean_ak)
+                            if existing_pos and (existing_pos.get("inst_id") == inst["symbol"] or inst["base"] in clean_ak):
+                                is_coin_already_open = True
+                                break
+                        if is_coin_already_open:
                             continue
 
                         wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
@@ -1776,6 +1812,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
         {
             "client": okx_client,
             "symbol": item["symbol"],
+            "base": item["base"],
             "label": f"{item['label']}_PB",
             "price_round": item["price_round"]
         }
@@ -1820,6 +1857,17 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                             active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
 
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
+                            continue
+
+                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety przez różne strategie
+                        is_coin_already_open = False
+                        for ak in active_keys:
+                            clean_ak = ak.replace(redis_trade.prefix, "")
+                            existing_pos = await redis_trade.get_position_state(clean_ak)
+                            if existing_pos and (existing_pos.get("inst_id") == inst["symbol"] or inst["base"] in clean_ak):
+                                is_coin_already_open = True
+                                break
+                        if is_coin_already_open:
                             continue
 
                         wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
