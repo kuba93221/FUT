@@ -108,7 +108,12 @@ CONFIG = {
     "SAFETY_GUARDS": {
         "SL_COOLDOWN_SECONDS": 45 * 60,      # 45 minut kwarantanny po uderzeniu w Stop Loss
         "MAX_SPREAD_PCT": 0.0020,            # 0.20% maksymalnego spreadu Bid/Ask (Spread Guard)
-        "DAILY_CIRCUIT_BREAKER_PCT": 0.03    # Max 3.0% dziennej straty kapitału (Circuit Breaker)
+        "DAILY_CIRCUIT_BREAKER_PCT": 0.03,   # Max 3.0% dziennej straty kapitału (Circuit Breaker)
+        "SMART_MONEY": {
+            "ENABLED": True,
+            "MAX_TAKER_IMBALANCE_RATIO": 1.35, # Blokada gdy wolumen przeciwny instytucji > 135%
+            "CACHE_TTL_SECONDS": 180           # Pamięć podręczna sentymentu (3 minuty)
+        }
     },
     "STRATEGY_PARAMS": {
         "MEAN_REVERSION": {
@@ -737,6 +742,110 @@ class MarketRegimeArbitrator:
         elif bandwidth <= 0.015:
             return "RANGING"
         return "NEUTRAL"
+
+class OKXSmartMoneyOracle:
+    """
+    Moduł analityczny OKX Rubik (Market Big Data / Smart Money).
+    Odpytuje publiczne endpointy danych instytucjonalnych o wolumenie Taker Buy/Sell
+    oraz proporcji pozycji rynkowych, chroniąc przed pułapkami płynnościowymi (Liquidity Grabs).
+    """
+    def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter, is_sandbox: bool = True):
+        self.session = session
+        self.rate_limiter = rate_limiter
+        self.is_sandbox = is_sandbox
+        self.primary_url = os.environ.get("OKX_API_URL", "https://eea.okx.com").rstrip('/')
+        self.fallback_url = "https://www.okx.com"
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self.ttl = CONFIG["SAFETY_GUARDS"].get("SMART_MONEY", {}).get("CACHE_TTL_SECONDS", 180)
+        self.enabled = CONFIG["SAFETY_GUARDS"].get("SMART_MONEY", {}).get("ENABLED", True)
+        self.max_imbalance = CONFIG["SAFETY_GUARDS"].get("SMART_MONEY", {}).get("MAX_TAKER_IMBALANCE_RATIO", 1.35)
+
+    async def _fetch_rubik_data(self, endpoint: str) -> Optional[List[Any]]:
+        """Pobiera dane analityczne Rubik z giełdy z automatycznym fallbackiem domeny."""
+        urls_to_try = [f"{self.primary_url}{endpoint}", f"{self.fallback_url}{endpoint}"]
+        headers = {"Content-Type": "application/json"}
+        if self.is_sandbox:
+            headers["x-simulated-trading"] = "1"
+
+        for url in urls_to_try:
+            try:
+                await self.rate_limiter.consume()
+                async with self.session.get(url, headers=headers, timeout=4) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("code") == "0" and data.get("data"):
+                            return data.get("data")
+            except Exception as e:
+                logger.debug(f"[SMART-MONEY-FETCH] Błąd odpytywania {url}: {e}")
+                continue
+        return None
+
+    async def get_taker_volume_flow(self, base_ccy: str) -> Dict[str, Any]:
+        """Bada agresywny wolumen rynkowy Taker Buy vs Taker Sell z ostatnich 5 minut."""
+        now = time.monotonic()
+        cache_key = f"TAKER_{base_ccy}"
+        if cache_key in self._cache and (now - self._cache[cache_key]["ts"] < self.ttl):
+            return self._cache[cache_key]["data"]
+
+        endpoint = f"/api/v5/rubik/stat/taker-volume?ccy={base_ccy}&instType=CONTRACTS&period=5m"
+        raw_data = await self._fetch_rubik_data(endpoint)
+        
+        parsed = {"buy_vol": 0.0, "sell_vol": 0.0, "ratio": 1.0, "dominant": "NEUTRAL"}
+        if raw_data and isinstance(raw_data, list) and len(raw_data) > 0:
+            latest = raw_data[0]
+            try:
+                if isinstance(latest, list) and len(latest) >= 3:
+                    buy_v = float(latest[1])
+                    sell_v = float(latest[2])
+                elif isinstance(latest, dict):
+                    buy_v = float(latest.get("buyVol", 0.0))
+                    sell_v = float(latest.get("sellVol", 0.0))
+                else:
+                    buy_v, sell_v = 0.0, 0.0
+
+                total_v = buy_v + sell_v
+                if total_v > 0:
+                    ratio = round(buy_v / sell_v, 2) if sell_v > 0 else 2.0
+                    dominant = "BUYERS" if ratio > 1.1 else ("SELLERS" if ratio < 0.9 else "NEUTRAL")
+                    parsed = {"buy_vol": buy_v, "sell_vol": sell_v, "ratio": ratio, "dominant": dominant}
+            except Exception as err:
+                logger.debug(f"[SMART-MONEY-PARSE] Błąd parsowania wolumenu {base_ccy}: {err}")
+
+        self._cache[cache_key] = {"data": parsed, "ts": now}
+        return parsed
+
+    async def check_smart_money_alignment(self, base_ccy: str, target_pos_side: str) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Żelazny weryfikator Smart Money:
+        - Blokuje wejście w LONG, jeśli agresywna podaż (Taker Sell) przekracza próg instytucjonalny (pułapka na byki).
+        - Blokuje wejście w SHORT, jeśli agresywny popyt (Taker Buy) dominuje rynek (pułapka na niedźwiedzie).
+        """
+        if not self.enabled:
+            return True, "SM_BYPASS_DISABLED", {}
+
+        flow = await self.get_taker_volume_flow(base_ccy)
+        buy_v = flow.get("buy_vol", 0.0)
+        sell_v = flow.get("sell_vol", 0.0)
+
+        # Jeśli brak danych (np. chwilowy brak publikacji Big Data w sandboxie) - graceful fallback
+        if buy_v == 0.0 and sell_v == 0.0:
+            return True, "SM_DATA_NEUTRAL", flow
+
+        if target_pos_side.lower() == "long":
+            # Chcemy kupić, ale agresywna sprzedaż jest o 35%+ wyższa niż zakupy
+            if sell_v > (buy_v * self.max_imbalance):
+                reason = f"Aggressive Institutional Sell Pressure (Taker Sell: {round(sell_v, 1)} > Buy: {round(buy_v, 1)})"
+                return False, reason, flow
+            return True, f"ZGODNY Z PRZEPŁYWEM (Taker Ratio: {flow.get('ratio')})", flow
+
+        elif target_pos_side.lower() == "short":
+            # Chcemy grać na spadki, ale agresywne zakupy są o 35%+ wyższe niż sprzedaż
+            if buy_v > (sell_v * self.max_imbalance):
+                reason = f"Aggressive Institutional Buy Absorption (Taker Buy: {round(buy_v, 1)} > Sell: {round(sell_v, 1)})"
+                return False, reason, flow
+            return True, f"ZGODNY Z PRZEPŁYWEM (Taker Ratio: {flow.get('ratio')})", flow
+
+        return True, "SM_ALIGNED", flow
 
 class OKXWebSocketPriceFeed:
     def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = True):
@@ -1462,7 +1571,7 @@ async def reconcile_and_timestop_futures(
 
     return False, None
 
-async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client):
+async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client, smart_money_oracle):
     logger.info("🌊 [MEAN-REV-WORKER] Start autonomicznego wątku Mean Reversion (Futures 3x).")
     instruments = [
         {
@@ -1489,7 +1598,6 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                 if pos_check and pos_check.get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
 
-                # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
                 has_pending = await inst["client"].has_pending_orders(inst["symbol"])
                 if has_pending:
                     continue
@@ -1535,6 +1643,12 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                     pos_side = "long" if signal_long else "short"
                     order_side = "buy" if signal_long else "sell"
 
+                    # Bezpiecznik Smart Money: badanie przepływu wolumenu instytucjonalnego
+                    sm_ok, sm_note, sm_flow = await smart_money_oracle.check_smart_money_alignment(inst["base"], pos_side)
+                    if not sm_ok:
+                        logger.warning(f"🐳 [SMART-MONEY-GUARD] {inst['label']} [{pos_side.upper()}] odrzucone przez Smart Money: {sm_note}")
+                        continue
+
                     async with GLOBAL_ALPHA_LOCK:
                         url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                         async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
@@ -1543,7 +1657,6 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
                             continue
 
-                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety (np. 2x BTC) przez różne strategie
                         is_coin_already_open = False
                         for ak in active_keys:
                             clean_ak = ak.replace(redis_trade.prefix, "")
@@ -1623,6 +1736,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                                     f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
+                                    f"🐳 Smart Money: <code>{sm_note}</code>\n"
                                     f"Strażnik Czasu: 8h | OCO: AKTYWNE"
                                 )
                             else:
@@ -1641,7 +1755,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
 
         await asyncio.sleep(60)
 
-async def independent_momentum_worker(session, redis_trade, tg, okx_client):
+async def independent_momentum_worker(session, redis_trade, tg, okx_client, smart_money_oracle):
     logger.info("🚀 [MOMENTUM-WORKER] Start autonomicznego wątku Momentum (Futures 3x).")
     instruments = [
         {
@@ -1668,7 +1782,6 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                 if pos_check and pos_check.get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
 
-                # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
                 has_pending = await inst["client"].has_pending_orders(inst["symbol"])
                 if has_pending:
                     continue
@@ -1699,6 +1812,12 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                     order_side = "buy" if mom["signal_long"] else "sell"
                     current_price = mom["current"]
 
+                    # Bezpiecznik Smart Money: ochrona przed pułapkami wolumenowymi na momentum
+                    sm_ok, sm_note, sm_flow = await smart_money_oracle.check_smart_money_alignment(inst["base"], pos_side)
+                    if not sm_ok:
+                        logger.warning(f"🐳 [SMART-MONEY-GUARD] {inst['label']} [{pos_side.upper()}] zablokowane: {sm_note}")
+                        continue
+
                     async with GLOBAL_ALPHA_LOCK:
                         url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                         async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
@@ -1707,7 +1826,6 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
                             continue
 
-                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety przez różne strategie
                         is_coin_already_open = False
                         for ak in active_keys:
                             clean_ak = ak.replace(redis_trade.prefix, "")
@@ -1787,6 +1905,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                                     f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
+                                    f"🐳 Smart Money: <code>{sm_note}</code>\n"
                                     f"Strażnik Czasu: 3h | OCO: AKTYWNE"
                                 )
                             else:
@@ -1804,7 +1923,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
 
         await asyncio.sleep(60)
 
-async def independent_breakout_worker(session, redis_trade, tg, okx_client):
+async def independent_breakout_worker(session, redis_trade, tg, okx_client, smart_money_oracle):
     logger.info("💥 [BREAKOUT-WORKER] Start autonomicznego wątku Breakout (Futures 3x).")
     instruments = [
         {
@@ -1831,7 +1950,6 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                 if pos_check and pos_check.get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
 
-                # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
                 has_pending = await inst["client"].has_pending_orders(inst["symbol"])
                 if has_pending:
                     continue
@@ -1862,6 +1980,12 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                     order_side = "buy" if brk["signal_long"] else "sell"
                     current_price = brk["current"]
 
+                    # Bezpiecznik Smart Money: weryfikacja prawdziwego wyłamania pasma
+                    sm_ok, sm_note, sm_flow = await smart_money_oracle.check_smart_money_alignment(inst["base"], pos_side)
+                    if not sm_ok:
+                        logger.warning(f"🐳 [SMART-MONEY-GUARD] {inst['label']} [{pos_side.upper()}] wybicie odrzucone: {sm_note}")
+                        continue
+
                     async with GLOBAL_ALPHA_LOCK:
                         url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                         async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
@@ -1870,7 +1994,6 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
                             continue
 
-                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety przez różne strategie
                         is_coin_already_open = False
                         for ak in active_keys:
                             clean_ak = ak.replace(redis_trade.prefix, "")
@@ -1950,6 +2073,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                     f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
+                                    f"🐳 Smart Money: <code>{sm_note}</code>\n"
                                     f"Strażnik Czasu: 3h | OCO: AKTYWNE"
                                 )
                             else:
@@ -1967,7 +2091,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
 
         await asyncio.sleep(180)
 
-async def independent_pullback_worker(session, redis_trade, tg, okx_client):
+async def independent_pullback_worker(session, redis_trade, tg, okx_client, smart_money_oracle):
     logger.info("🎯 [PULLBACK-WORKER] Start autonomicznego wątku Trend Pullback (retest EMA-20).")
     instruments = [
         {
@@ -1994,7 +2118,6 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                 if pos_check and pos_check.get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
 
-                # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
                 has_pending = await inst["client"].has_pending_orders(inst["symbol"])
                 if has_pending:
                     continue
@@ -2025,6 +2148,12 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                     order_side = "buy" if pb["signal_long"] else "sell"
                     current_price = pb["current"]
 
+                    # Bezpiecznik Smart Money: badanie podparcia instytucjonalnego na korekcie
+                    sm_ok, sm_note, sm_flow = await smart_money_oracle.check_smart_money_alignment(inst["base"], pos_side)
+                    if not sm_ok:
+                        logger.warning(f"🐳 [SMART-MONEY-GUARD] {inst['label']} [{pos_side.upper()}] odrzucone: {sm_note}")
+                        continue
+
                     async with GLOBAL_ALPHA_LOCK:
                         url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                         async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
@@ -2033,7 +2162,6 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
                             continue
 
-                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety przez różne strategie
                         is_coin_already_open = False
                         for ak in active_keys:
                             clean_ak = ak.replace(redis_trade.prefix, "")
@@ -2113,6 +2241,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                                     f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
+                                    f"🐳 Smart Money: <code>{sm_note}</code>\n"
                                     f"Strażnik Czasu: 6h | OCO: AKTYWNE"
                                 )
                             else:
@@ -2150,6 +2279,7 @@ async def continuous_async_cron(loop):
             session
         )
         okx_client = OKXFuturesClient(session, RATE_LIMITER, is_sandbox=IS_SANDBOX)
+        smart_money_oracle = OKXSmartMoneyOracle(session, RATE_LIMITER, is_sandbox=IS_SANDBOX)
         ws_feed = OKXWebSocketPriceFeed(session, is_sandbox=IS_SANDBOX)
         GLOBAL_WS_FEED = ws_feed
 
@@ -2167,15 +2297,15 @@ async def continuous_async_cron(loop):
             if spec:
                 logger.info(f"🛡️ [LEVERAGE-STATUS] {sym} | Dźwignia 3x [LONG: {lev_l}, SHORT: {lev_s}]")
 
-        await tg.push(f"🚀 <b>Silnik Futures 3x ({QUOTE_CCY}) wystartował!</b>")
+        await tg.push(f"🚀 <b>Silnik Futures 3x ({QUOTE_CCY}) wystartował! [SMART-MONEY: AKTYWNY]</b>")
 
-        # 2. Start workerów asynchronicznych
+        # 2. Start workerów asynchronicznych z oraklem Smart Money
         tasks = [
             asyncio.create_task(ws_feed.start_listener(symbols_to_stream)),
-            asyncio.create_task(independent_mean_reversion_worker(session, redis_trade, tg, okx_client)),
-            asyncio.create_task(independent_momentum_worker(session, redis_trade, tg, okx_client)),
-            asyncio.create_task(independent_breakout_worker(session, redis_trade, tg, okx_client)),
-            asyncio.create_task(independent_pullback_worker(session, redis_trade, tg, okx_client))
+            asyncio.create_task(independent_mean_reversion_worker(session, redis_trade, tg, okx_client, smart_money_oracle)),
+            asyncio.create_task(independent_momentum_worker(session, redis_trade, tg, okx_client, smart_money_oracle)),
+            asyncio.create_task(independent_breakout_worker(session, redis_trade, tg, okx_client, smart_money_oracle)),
+            asyncio.create_task(independent_pullback_worker(session, redis_trade, tg, okx_client, smart_money_oracle))
         ]
 
         heartbeat_timer = 0
