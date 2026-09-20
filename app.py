@@ -1404,18 +1404,29 @@ class OKXFuturesClient:
                 data = await resp.json()
                 if data.get("code") == "0" and data.get("data"):
                     t = data["data"][0]
-                    bid = float(t.get("bidPx", 0.0))
-                    ask = float(t.get("askPx", 0.0))
-                    if bid > 0 and ask > 0:
-                        spread_pct = (ask - bid) / bid
-                        if spread_pct > max_spread_pct:
-                            logger.warning(f"🛡️ [SPREAD-GUARD] {symbol} zbyt szeroki spread: {round(spread_pct*100, 3)}% > {round(max_spread_pct*100, 2)}%. Wejście wstrzymane.")
-                            return False, spread_pct
-                        return True, spread_pct
-                return True, 0.0
+                    raw_bid = t.get("bidPx")
+                    raw_ask = t.get("askPx")
+                    
+                    # ŻELAZNA OCHRONA: Pusty string lub brak ofert = natychmiastowa blokada wejścia
+                    if not raw_bid or not raw_ask or str(raw_bid).strip() == "" or str(raw_ask).strip() == "":
+                        logger.warning(f"🛡️ [SPREAD-GUARD] {symbol} brak płynności (pusty Bid/Ask w arkuszu). Wejście zablokowane.")
+                        return False, 0.0
+
+                    bid = float(raw_bid)
+                    ask = float(raw_ask)
+                    if bid <= 0 or ask <= 0:
+                        logger.warning(f"🛡️ [SPREAD-GUARD] {symbol} zerowy kurs Bid/Ask. Wejście zablokowane.")
+                        return False, 0.0
+
+                    spread_pct = (ask - bid) / bid
+                    if spread_pct > max_spread_pct:
+                        logger.warning(f"🛡️ [SPREAD-GUARD] {symbol} zbyt szeroki spread: {round(spread_pct*100, 3)}% > {round(max_spread_pct*100, 2)}%. Wejście wstrzymane.")
+                        return False, spread_pct
+                    return True, spread_pct
+                return False, 0.0
         except Exception as e:
             logger.error(f"[SPREAD-CHECK-ERROR] Błąd sprawdzania spreadu {symbol}: {e}")
-            return True, 0.0
+            return False, 0.0
 
     async def get_algo_order_state(self, algo_id: str) -> Tuple[Optional[str], Optional[float]]:
         if not self.api_key or not self.secret_key or not self.passphrase:
