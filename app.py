@@ -1432,7 +1432,7 @@ async def reconcile_and_timestop_futures(
             await asyncio.sleep(0.3)
 
             exit_side = "sell" if pos_side == "long" else "buy"
-            await inst["client"].execute_futures_order(
+            liq_order_res = await inst["client"].execute_futures_order(
                 symbol=inst["symbol"],
                 side=exit_side,
                 pos_side=pos_side,
@@ -1440,18 +1440,25 @@ async def reconcile_and_timestop_futures(
                 ord_type="market",
                 reduce_only=True
             )
-            await redis_trade.delete_key(pos_key)
-            logger.info(f"🔓 [SLOT-FREED] Zwolniono slot ALFA dla {inst['label']}.")
+            
+            # ŻELAZNY BEZPIECZNIK: Zwalniamy slot TYLKO wtedy, gdy giełda faktycznie przyjęła zlecenie likwidacji!
+            if liq_order_res and liq_order_res.get("code") == "0":
+                await redis_trade.delete_key(pos_key)
+                logger.info(f"🔓 [SLOT-FREED] Zwolniono slot ALFA dla {inst['label']}.")
 
-            await tg.push(
-                f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
-                f"──────────────────────────────\n"
-                f"📈 Strategia: <b>{strategy_type}</b> [{pos_side.upper()}]\n"
-                f"⌛ Czas: <b>{round(elapsed_time/3600, 1)}h</b> / Limit: {round(max_timeout/3600, 1)}h\n"
-                f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Lewar: 3x)\n"
-                f"Pozycja zlikwidowana rynkowo z reduceOnly. Slot uwolniony."
-            )
-            return True, pos_key
+                await tg.push(
+                    f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
+                    f"──────────────────────────────\n"
+                    f"📈 Strategia: <b>{strategy_type}</b> [{pos_side.upper()}]\n"
+                    f"⌛ Czas: <b>{round(elapsed_time/3600, 1)}h</b> / Limit: {round(max_timeout/3600, 1)}h\n"
+                    f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Lewar: 3x)\n"
+                    f"Pozycja zlikwidowana rynkowo z reduceOnly. Slot uwolniony."
+                )
+                return True, pos_key
+            else:
+                err_msg = liq_order_res.get("msg", "Nieznany błąd") if liq_order_res else "Brak odpowiedzi"
+                logger.error(f"❌ [TIME-STOP-REJECTED] Giełda odrzuciła likwidację {inst['label']}: {err_msg}. Pozycja i slot pozostają zablokowane w Redis do ponowienia.")
+                return False, None
 
     return False, None
 
@@ -1682,6 +1689,121 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
                 if not candles_raw:
                     continue
+
+                mom = MomentumQuantCore.calculate_momentum(candles_raw)
+                if not mom:
+                    continue
+
+                if mom["signal_long"] or mom["signal_short"]:
+                    pos_side = "long" if mom["signal_long"] else "short"
+                    order_side = "buy" if mom["signal_long"] else "sell"
+                    current_price = mom["current"]
+
+                    async with GLOBAL_ALPHA_LOCK:
+                        url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
+                        async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
+                            active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
+
+                        if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
+                            continue
+
+                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety przez różne strategie
+                        is_coin_already_open = False
+                        for ak in active_keys:
+                            clean_ak = ak.replace(redis_trade.prefix, "")
+                            existing_pos = await redis_trade.get_position_state(clean_ak)
+                            if existing_pos and (existing_pos.get("inst_id") == inst["symbol"] or inst["base"] in clean_ak):
+                                is_coin_already_open = True
+                                break
+                        if is_coin_already_open:
+                            continue
+
+                        wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
+                        available_cash = wallet.get("available_cash", 0.0)
+
+                        if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
+                            continue
+
+                        price_sl, price_tp, sl_pct = calculate_clamped_sl_tp(
+                            current_price,
+                            mom["atr"],
+                            CONFIG["STRATEGY_PARAMS"]["MOMENTUM"]["ATR_SL_MULT"],
+                            CONFIG["STRATEGY_PARAMS"]["MOMENTUM"]["RR_RATIO"],
+                            inst["price_round"],
+                            pos_side=pos_side
+                        )
+
+                        risk_capital = available_cash * CONFIG["RISK_PER_TRADE_PCT"]
+                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
+                        target_margin = min(risk_capital / sl_pct, available_cash * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
+
+                        contracts, actual_margin = inst["client"].calculate_contract_size(
+                            inst["symbol"],
+                            current_price,
+                            target_margin,
+                            safe_cash
+                        )
+                        if contracts <= 0 or actual_margin > available_cash:
+                            continue
+
+                        order_res = await inst["client"].execute_futures_order(
+                            inst["symbol"],
+                            side=order_side,
+                            pos_side=pos_side,
+                            quantity=contracts,
+                            ord_type="market"
+                        )
+
+                        if order_res and order_res.get("code") == "0":
+                            logger.info(f"🚨 [MOMENTUM-TRIGGER] Sukces SWAP {inst['label']} [{pos_side.upper()}] ROC: {mom['roc']}% | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
+                            now_ts = time.time()
+                            oco_res = await inst["client"].execute_futures_oco(
+                                inst["symbol"],
+                                pos_side=pos_side,
+                                quantity=contracts,
+                                price_tp=price_tp,
+                                price_sl=price_sl
+                            )
+                            if oco_res and oco_res.get("code") == "0" and oco_res.get("data"):
+                                algo_id = oco_res["data"][0].get("algoId", "")
+                                await redis_trade.set_position_state(pos_key, {
+                                    "status": "WAITING_OCO",
+                                    "inst_id": inst["symbol"],
+                                    "algo_id": algo_id,
+                                    "contracts": contracts,
+                                    "pos_side": pos_side,
+                                    "margin_locked": actual_margin,
+                                    "entry_price": current_price,
+                                    "tp_price": price_tp,
+                                    "sl_price": price_sl,
+                                    "time": now_ts,
+                                    "strategy": "MOMENTUM"
+                                })
+                                await tg.push(
+                                    f"🟢 <b>[WEJŚCIE: {inst['label']}] • MOMENTUM</b>\n"
+                                    f"──────────────────────────────\n"
+                                    f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
+                                    f"💰 Kurs: <b>{current_price} {QUOTE_CCY}</b> (ROC: {mom['roc']}%)\n"
+                                    f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
+                                    f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
+                                    f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
+                                    f"Strażnik Czasu: 3h | OCO: AKTYWNE"
+                                )
+                            else:
+                                await inst["client"].execute_futures_order(
+                                    inst["symbol"],
+                                    side=("sell" if pos_side == "long" else "buy"),
+                                    pos_side=pos_side,
+                                    quantity=contracts,
+                                    ord_type="market",
+                                    reduce_only=True
+                                )
+                                await redis_trade.delete_key(pos_key)
+        except Exception as e:
+            logger.error(f"❌ [MOMENTUM-ERROR] Błąd workera: {e}")
+
+        await asyncio.sleep(60)
+
 async def independent_breakout_worker(session, redis_trade, tg, okx_client):
     logger.info("💥 [BREAKOUT-WORKER] Start autonomicznego wątku Breakout (Futures 3x).")
     instruments = [
@@ -1729,6 +1851,10 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
 
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
                 if not candles_raw:
+                    continue
+
+                brk = BreakoutQuantCore.calculate_breakout(candles_raw)
+                if not brk:
                     continue
 
                 if brk["signal_long"] or brk["signal_short"]:
@@ -1824,7 +1950,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                     f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
                                     f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
                                     f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
-                                    f"Strażnik Czasu: 6h | OCO: AKTYWNE"
+                                    f"Strażnik Czasu: 3h | OCO: AKTYWNE"
                                 )
                             else:
                                 await inst["client"].execute_futures_order(
