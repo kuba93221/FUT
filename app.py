@@ -100,10 +100,15 @@ CONFIG = {
         "DEFAULT_SL_PCT": 0.015   # 1.5% ruchu bazowego = 4.5% straty na 3x
     },
     "TIMEOUTS": {
-        "MOMENTUM": 6 * 3600,        # 6 godzin dla strategii impulsowych
-        "BREAKOUT": 6 * 3600,        # 6 godzin dla wybicia zmienności
+        "MOMENTUM": 3 * 3600,        # Zoptymalizowano do 3h dla strategii impulsowych
+        "BREAKOUT": 3 * 3600,        # Zoptymalizowano do 3h dla wybicia zmienności
         "TREND_PULLBACK": 6 * 3600,  # 6 godzin dla wejścia z trendem
         "MEAN_REVERSION": 8 * 3600   # 8 godzin dla powrotu do średniej
+    },
+    "SAFETY_GUARDS": {
+        "SL_COOLDOWN_SECONDS": 45 * 60,      # 45 minut kwarantanny po uderzeniu w Stop Loss
+        "MAX_SPREAD_PCT": 0.0020,            # 0.20% maksymalnego spreadu Bid/Ask (Spread Guard)
+        "DAILY_CIRCUIT_BREAKER_PCT": 0.03    # Max 3.0% dziennej straty kapitału (Circuit Breaker)
     },
     "STRATEGY_PARAMS": {
         "MEAN_REVERSION": {
@@ -432,6 +437,74 @@ class UpstashRedisFuturesBridge:
         except Exception as e:
             logger.error(f"❌ [REDIS-DEL-ERROR] Błąd usuwania klucza {key}: {e}")
             return False
+
+    async def set_cooldown(self, base_symbol: str, ttl_seconds: int = 2700) -> bool:
+        """Nakłada kwarantannę na daną kryptowalutę po uderzeniu w Stop Loss (domyślnie 45 min)."""
+        if not self.url:
+            return False
+        safe_key = self._enforce_prefix(f"COOLDOWN:{base_symbol}")
+        try:
+            url = f"{self.url}/set/{safe_key}/ACTIVE/EX/{ttl_seconds}"
+            async with self.session.get(url, headers=self.headers, timeout=4) as resp:
+                return resp.status == 200
+        except Exception as e:
+            logger.error(f"❌ [REDIS-COOLDOWN-ERROR] Błąd ustawiania kwarantanny dla {base_symbol}: {e}")
+            return False
+
+    async def is_cooldown_active(self, base_symbol: str) -> bool:
+        """Weryfikuje, czy dana kryptowaluta jest objęta aktywną kwarantanną po Stop Lossie."""
+        if not self.url:
+            return False
+        safe_key = self._enforce_prefix(f"COOLDOWN:{base_symbol}")
+        try:
+            url = f"{self.url}/get/{safe_key}"
+            async with self.session.get(url, headers=self.headers, timeout=4) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+                return data.get("result") is not None and data.get("result") != ""
+        except Exception:
+            return False
+
+    async def add_daily_loss(self, loss_amount: float) -> float:
+        """Akumuluje zrealizowaną stratę z bieżącego dnia UTC dla wyłącznika Circuit Breaker."""
+        if not self.url or loss_amount <= 0:
+            return 0.0
+        today_str = datetime.now(UTC).strftime('%Y%m%d')
+        safe_key = self._enforce_prefix(f"DAILY_LOSS:{today_str}")
+        try:
+            url_get = f"{self.url}/get/{safe_key}"
+            current_loss = 0.0
+            async with self.session.get(url_get, headers=self.headers, timeout=4) as resp:
+                if resp.status == 200:
+                    res = (await resp.json()).get("result")
+                    if res:
+                        current_loss = float(res)
+            new_total = round(current_loss + loss_amount, 4)
+            url_set = f"{self.url}/set/{safe_key}/{new_total}/EX/86400"
+            async with self.session.get(url_set, headers=self.headers, timeout=4):
+                pass
+            return new_total
+        except Exception as e:
+            logger.error(f"❌ [REDIS-CIRCUIT-ERROR] Błąd rejestracji dziennej straty: {e}")
+            return 0.0
+
+    async def get_daily_loss(self) -> float:
+        """Pobiera skumulowaną stratę zrealizowaną w bieżącym dniu UTC."""
+        if not self.url:
+            return 0.0
+        today_str = datetime.now(UTC).strftime('%Y%m%d')
+        safe_key = self._enforce_prefix(f"DAILY_LOSS:{today_str}")
+        try:
+            url = f"{self.url}/get/{safe_key}"
+            async with self.session.get(url, headers=self.headers, timeout=4) as resp:
+                if resp.status == 200:
+                    res = (await resp.json()).get("result")
+                    if res:
+                        return float(res)
+            return 0.0
+        except Exception:
+            return 0.0
 
 class TelegramThrottledDispatcher:
     def __init__(self, token: str, chat_id: str, session: aiohttp.ClientSession):
@@ -1209,6 +1282,32 @@ class OKXFuturesClient:
             logger.error(f"[POS-HISTORY-ERROR] Błąd pobierania historii pozycji {symbol}: {e}")
             return None
 
+    async def check_spread_allowed(self, symbol: str, max_spread_pct: float = 0.0020) -> Tuple[bool, float]:
+        """Weryfikuje Spread Guard: sprawdza czy rozpiętość Bid/Ask nie przekracza dopuszczalnego progu."""
+        await self.rate_limiter.consume()
+        request_path = f"/api/v5/market/ticker?instId={symbol}"
+        url = f"{self.base_url}{request_path}"
+        headers = {"Content-Type": "application/json"}
+        if self.is_sandbox:
+            headers["x-simulated-trading"] = "1"
+        try:
+            async with self.session.get(url, headers=headers, timeout=4) as resp:
+                data = await resp.json()
+                if data.get("code") == "0" and data.get("data"):
+                    t = data["data"][0]
+                    bid = float(t.get("bidPx", 0.0))
+                    ask = float(t.get("askPx", 0.0))
+                    if bid > 0 and ask > 0:
+                        spread_pct = (ask - bid) / bid
+                        if spread_pct > max_spread_pct:
+                            logger.warning(f"🛡️ [SPREAD-GUARD] {symbol} zbyt szeroki spread: {round(spread_pct*100, 3)}% > {round(max_spread_pct*100, 2)}%. Wejście wstrzymane.")
+                            return False, spread_pct
+                        return True, spread_pct
+                return True, 0.0
+        except Exception as e:
+            logger.error(f"[SPREAD-CHECK-ERROR] Błąd sprawdzania spreadu {symbol}: {e}")
+            return True, 0.0
+
     async def get_algo_order_state(self, algo_id: str) -> Tuple[Optional[str], Optional[float]]:
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None, None
@@ -1295,13 +1394,33 @@ async def reconcile_and_timestop_futures(
                 roe_net = round((pnl_net / margin_locked) * 100.0, 2) if margin_locked > 0 else 0.0
 
             icon = "🎉 <b>[ZYSK TAKE PROFIT]" if pnl_net >= 0 else "🛑 <b>[STOP LOSS / WYJŚCIE]"
+            
+            cooldown_msg = ""
+            if pnl_net < 0:
+                cooldown_sec = CONFIG["SAFETY_GUARDS"]["SL_COOLDOWN_SECONDS"]
+                await redis_trade.set_cooldown(inst["base"], cooldown_sec)
+                cooldown_msg = f"\n⏳ <b>Kwarantanna:</b> Nałożono {int(cooldown_sec/60)} min blokady na {inst['base']}."
+                
+                accum_loss = await redis_trade.add_daily_loss(abs(pnl_net))
+                wallet_cb = await inst["client"].get_wallet_balances(QUOTE_CCY)
+                eq_cb = wallet_cb.get("total_equity", 1000.0)
+                max_daily_loss = eq_cb * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]
+                if accum_loss >= max_daily_loss:
+                    await tg.push(
+                        f"🚨 <b>[CIRCUIT BREAKER: AKTYWACJA]</b>\n"
+                        f"──────────────────────────────\n"
+                        f"Dzienna strata osiągnęła <b>-{round(accum_loss, 2)} {QUOTE_CCY}</b> "
+                        f"(Limit: {round(max_daily_loss, 2)} {QUOTE_CCY} / {int(CONFIG['SAFETY_GUARDS']['DAILY_CIRCUIT_BREAKER_PCT']*100)}%).\n"
+                        f"Handel na nowych pozycjach wstrzymany do jutra."
+                    )
+
             await tg.push(
                 f"{icon} • {inst['label']}</b>\n"
                 f"──────────────────────────────\n"
                 f"📈 Strategia: <b>{strategy_type}</b> [{pos_side.upper()}]\n"
                 f"💰 Wyjście: <b>{exit_p} {QUOTE_CCY}</b> (Wejście: {entry_p} {QUOTE_CCY})\n"
                 f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: {margin_locked} {QUOTE_CCY} 3x)\n"
-                f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY} ({roe_net}%)</b>\n"
+                f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY} ({roe_net}%)</b>{cooldown_msg}\n"
                 f"Slot ALFA zwolniony natychmiast."
             )
             return True, pos_key
@@ -1366,6 +1485,19 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                 # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
                 has_pending = await inst["client"].has_pending_orders(inst["symbol"])
                 if has_pending:
+                    continue
+
+                if await redis_trade.is_cooldown_active(inst["base"]):
+                    continue
+
+                daily_loss = await redis_trade.get_daily_loss()
+                wallet_check = await inst["client"].get_wallet_balances(QUOTE_CCY)
+                equity_check = wallet_check.get("total_equity", 1000.0)
+                if daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
+                    continue
+
+                spread_ok, _ = await inst["client"].check_spread_allowed(inst["symbol"], CONFIG["SAFETY_GUARDS"]["MAX_SPREAD_PCT"])
+                if not spread_ok:
                     continue
 
                 ticker = await inst["client"].get_market_ticker(inst["symbol"])
@@ -1534,128 +1666,22 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                 if has_pending:
                     continue
 
+                if await redis_trade.is_cooldown_active(inst["base"]):
+                    continue
+
+                daily_loss = await redis_trade.get_daily_loss()
+                wallet_check = await inst["client"].get_wallet_balances(QUOTE_CCY)
+                equity_check = wallet_check.get("total_equity", 1000.0)
+                if daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
+                    continue
+
+                spread_ok, _ = await inst["client"].check_spread_allowed(inst["symbol"], CONFIG["SAFETY_GUARDS"]["MAX_SPREAD_PCT"])
+                if not spread_ok:
+                    continue
+
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
                 if not candles_raw:
                     continue
-
-                regime = MarketRegimeArbitrator.get_regime(candles_raw)
-                if regime == "RANGING":
-                    continue
-
-                mom = MomentumQuantCore.calculate_momentum(candles_raw, period=CONFIG["STRATEGY_PARAMS"]["MOMENTUM"]["ROC_PERIOD"])
-                if not mom:
-                    continue
-
-                if mom["signal_long"] or mom["signal_short"]:
-                    pos_side = "long" if mom["signal_long"] else "short"
-                    order_side = "buy" if mom["signal_long"] else "sell"
-                    current_price = mom["current"]
-
-                    async with GLOBAL_ALPHA_LOCK:
-                        url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
-                        async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
-                            active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
-
-                        if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
-                            continue
-
-                        # TWARDY BEZPIECZNIK: Zakaz dublowania tej samej monety przez różne strategie
-                        is_coin_already_open = False
-                        for ak in active_keys:
-                            clean_ak = ak.replace(redis_trade.prefix, "")
-                            existing_pos = await redis_trade.get_position_state(clean_ak)
-                            if existing_pos and (existing_pos.get("inst_id") == inst["symbol"] or inst["base"] in clean_ak):
-                                is_coin_already_open = True
-                                break
-                        if is_coin_already_open:
-                            continue
-
-                        wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
-                        available_cash = wallet.get("available_cash", 0.0)
-
-                        if available_cash < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
-                            continue
-
-                        price_sl, price_tp, sl_pct = calculate_clamped_sl_tp(
-                            current_price,
-                            mom["atr"],
-                            CONFIG["STRATEGY_PARAMS"]["MOMENTUM"]["ATR_SL_MULT"],
-                            CONFIG["STRATEGY_PARAMS"]["MOMENTUM"]["RR_RATIO"],
-                            inst["price_round"],
-                            pos_side=pos_side
-                        )
-
-                        risk_capital = available_cash * CONFIG["RISK_PER_TRADE_PCT"]
-                        safe_cash = max(0.0, available_cash - CONFIG["RESERVE_CASH_BUFFER_QUOTE"])
-                        target_margin = min(risk_capital / sl_pct, available_cash * CONFIG["MAX_POSITION_PORTFOLIO_RATIO"], safe_cash * 0.95)
-
-                        contracts, actual_margin = inst["client"].calculate_contract_size(
-                            inst["symbol"],
-                            current_price,
-                            target_margin,
-                            safe_cash
-                        )
-                        if contracts <= 0 or actual_margin > available_cash:
-                            continue
-
-                        order_res = await inst["client"].execute_futures_order(
-                            inst["symbol"],
-                            side=order_side,
-                            pos_side=pos_side,
-                            quantity=contracts,
-                            ord_type="market"
-                        )
-
-                        if order_res and order_res.get("code") == "0":
-                            logger.info(f"🚨 [MOMENTUM-TRIGGER] Sukces SWAP {inst['label']} [{pos_side.upper()}] ROC: {mom['roc']}% | Kontrakty: {format_sz(contracts)} | Margines: {actual_margin} {QUOTE_CCY}")
-                            now_ts = time.time()
-                            oco_res = await inst["client"].execute_futures_oco(
-                                inst["symbol"],
-                                pos_side=pos_side,
-                                quantity=contracts,
-                                price_tp=price_tp,
-                                price_sl=price_sl
-                            )
-                            if oco_res and oco_res.get("code") == "0" and oco_res.get("data"):
-                                algo_id = oco_res["data"][0].get("algoId", "")
-                                await redis_trade.set_position_state(pos_key, {
-                                    "status": "WAITING_OCO",
-                                    "inst_id": inst["symbol"],
-                                    "algo_id": algo_id,
-                                    "contracts": contracts,
-                                    "pos_side": pos_side,
-                                    "margin_locked": actual_margin,
-                                    "entry_price": current_price,
-                                    "tp_price": price_tp,
-                                    "sl_price": price_sl,
-                                    "time": now_ts,
-                                    "strategy": "MOMENTUM"
-                                })
-                                await tg.push(
-                                    f"🟢 <b>[WEJŚCIE: {inst['label']}] • MOMENTUM</b>\n"
-                                    f"──────────────────────────────\n"
-                                    f"Pozycja: <b>{pos_side.upper()} (3x Izolowany)</b>\n"
-                                    f"💰 Kurs: <b>{current_price} {QUOTE_CCY}</b> (ROC: {mom['roc']}%)\n"
-                                    f"📦 Kontrakty: <b>{format_sz(contracts)} sz</b> (Margines: ~{actual_margin} {QUOTE_CCY})\n"
-                                    f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
-                                    f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-{round(sl_pct*100, 2)}%)\n"
-                                    f"Strażnik Czasu: 6h | OCO: AKTYWNE"
-                                )
-                            else:
-                                await inst["client"].execute_futures_order(
-                                    inst["symbol"],
-                                    side=("sell" if pos_side == "long" else "buy"),
-                                    pos_side=pos_side,
-                                    quantity=contracts,
-                                    ord_type="market",
-                                    reduce_only=True
-                                )
-                                await redis_trade.delete_key(pos_key)
-        except Exception as e:
-            logger.error(f"❌ [MOMENTUM-ERROR] Błąd workera: {e}")
-
-        await asyncio.sleep(180)
-
 async def independent_breakout_worker(session, redis_trade, tg, okx_client):
     logger.info("💥 [BREAKOUT-WORKER] Start autonomicznego wątku Breakout (Futures 3x).")
     instruments = [
@@ -1688,12 +1714,21 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                 if has_pending:
                     continue
 
-                candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
-                if not candles_raw:
+                if await redis_trade.is_cooldown_active(inst["base"]):
                     continue
 
-                brk = BreakoutQuantCore.calculate_breakout(candles_raw, period=CONFIG["STRATEGY_PARAMS"]["BREAKOUT"]["BB_PERIOD"])
-                if not brk:
+                daily_loss = await redis_trade.get_daily_loss()
+                wallet_check = await inst["client"].get_wallet_balances(QUOTE_CCY)
+                equity_check = wallet_check.get("total_equity", 1000.0)
+                if daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
+                    continue
+
+                spread_ok, _ = await inst["client"].check_spread_allowed(inst["symbol"], CONFIG["SAFETY_GUARDS"]["MAX_SPREAD_PCT"])
+                if not spread_ok:
+                    continue
+
+                candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
+                if not candles_raw:
                     continue
 
                 if brk["signal_long"] or brk["signal_short"]:
@@ -1836,6 +1871,19 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client):
                 # Żelazny bezpiecznik: nie otwieraj nowego zlecenia, jeśli na giełdzie wisi niewypełnione zlecenie wejścia!
                 has_pending = await inst["client"].has_pending_orders(inst["symbol"])
                 if has_pending:
+                    continue
+
+                if await redis_trade.is_cooldown_active(inst["base"]):
+                    continue
+
+                daily_loss = await redis_trade.get_daily_loss()
+                wallet_check = await inst["client"].get_wallet_balances(QUOTE_CCY)
+                equity_check = wallet_check.get("total_equity", 1000.0)
+                if daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
+                    continue
+
+                spread_ok, _ = await inst["client"].check_spread_allowed(inst["symbol"], CONFIG["SAFETY_GUARDS"]["MAX_SPREAD_PCT"])
+                if not spread_ok:
                     continue
 
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
