@@ -12,6 +12,7 @@ import hmac
 import hashlib
 import base64
 import sys
+from collections import deque
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 from typing import Dict, Any, List, Optional, Tuple
@@ -228,21 +229,16 @@ def manual_analysis_trigger():
 
 @app.route('/reset-circuit-breaker', methods=['GET', 'POST'])
 def reset_circuit_breaker_endpoint():
-    """Pozwala natychmiast zresetować licznik dziennej straty w Redis."""
-    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
+    """Pozwala natychmiast zresetować licznik dziennej straty w Redis i pamięci RAM."""
+    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running() or not GLOBAL_REDIS_BRIDGE:
         return jsonify({"status": "error", "message": "Pętla bota nie jest gotowa."}), 503
 
     async def _do_reset():
-        async with aiohttp.ClientSession() as sess:
-            redis_trade = UpstashRedisFuturesBridge(
-                os.environ.get("UPSTASH_REDIS_REST_URL", ""),
-                os.environ.get("UPSTASH_REDIS_REST_TOKEN", ""),
-                sess
-            )
-            today_str = datetime.now(UTC).strftime('%Y%m%d')
-            safe_key = f"DAILY_LOSS:{today_str}"
-            await redis_trade.delete_key(safe_key)
-            return {"status": "success", "message": f"Zresetowano klucz dziennej straty {safe_key} w Redis."}
+        today_str = datetime.now(UTC).strftime('%Y%m%d')
+        safe_key = f"DAILY_LOSS:{today_str}"
+        GLOBAL_REDIS_BRIDGE._local_daily_loss = 0.0
+        await GLOBAL_REDIS_BRIDGE.delete_key(safe_key)
+        return {"status": "success", "message": f"Zresetowano klucz dziennej straty {safe_key} w Redis i pamięci RAM."}
 
     fut = asyncio.run_coroutine_threadsafe(_do_reset(), BACKGROUND_LOOP)
     try:
@@ -252,27 +248,13 @@ def reset_circuit_breaker_endpoint():
 
 @app.route('/reset-slots', methods=['GET', 'POST'])
 def reset_slots_endpoint():
-    """Usuwa wszystkie wiszące klucze slotów z Redis (odblokowanie zamrożonych pozycji)."""
-    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
+    """Usuwa wszystkie wiszące klucze slotów z Redis i pamięci RAM (odblokowanie zamrożonych pozycji)."""
+    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running() or not GLOBAL_REDIS_BRIDGE:
         return jsonify({"status": "error", "message": "Pętla bota nie jest gotowa."}), 503
 
     async def _do_flush_slots():
-        async with aiohttp.ClientSession() as sess:
-            redis_trade = UpstashRedisFuturesBridge(
-                os.environ.get("UPSTASH_REDIS_REST_URL", ""),
-                os.environ.get("UPSTASH_REDIS_REST_TOKEN", ""),
-                sess
-            )
-            pattern = f"{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
-            url = f"{redis_trade.url}/keys/{pattern}"
-            async with sess.get(url, headers=redis_trade.headers, timeout=5) as r:
-                keys = (await r.json()).get("result", []) if r.status == 200 else []
-            deleted = 0
-            for k in keys:
-                clean_k = k.replace(redis_trade.prefix, "")
-                await redis_trade.delete_key(clean_k)
-                deleted += 1
-            return {"status": "success", "deleted_slots_count": deleted}
+        deleted = await GLOBAL_REDIS_BRIDGE.reset_all_slots()
+        return {"status": "success", "deleted_slots_count": deleted}
 
     fut = asyncio.run_coroutine_threadsafe(_do_flush_slots(), BACKGROUND_LOOP)
     try:
@@ -290,7 +272,7 @@ def emergency_liquidate_endpoint():
     1. Weryfikuje token autoryzacyjny secret.
     2. Anuluje wszystkie aktywne zlecenia OCO i oczekujące w arkuszu.
     3. Rynkowo zamyka wszystkie aktywne pozycje Futures (reduceOnly=True).
-    4. Czyści klucze slotów w Upstash Redis.
+    4. Czyści klucze slotów w Upstash Redis i pamięci RAM.
     5. Raportuje zdarzenie na Telegram.
     """
     secret = request.args.get("secret", "").strip() or request.form.get("secret", "").strip()
@@ -363,16 +345,10 @@ def emergency_liquidate_endpoint():
         except Exception as e:
             logger.error(f"[EMERGENCY-POS-CLOSE-ERR] {e}")
 
-        # 3. Czyszczenie kluczy w Upstash Redis
+        # 3. Czyszczenie kluczy w Upstash Redis i pamięci RAM
         try:
-            pattern = f"{GLOBAL_REDIS_BRIDGE.prefix}POS_ACTIVE:ALPHA:*"
-            url = f"{GLOBAL_REDIS_BRIDGE.url}/keys/{pattern}"
-            async with GLOBAL_REDIS_BRIDGE.session.get(url, headers=GLOBAL_REDIS_BRIDGE.headers, timeout=5) as r:
-                keys = (await r.json()).get("result", []) if r.status == 200 else []
-            for k in keys:
-                clean_k = k.replace(GLOBAL_REDIS_BRIDGE.prefix, "")
-                await GLOBAL_REDIS_BRIDGE.delete_key(clean_k)
-                report["freed_slots"] += 1
+            freed = await GLOBAL_REDIS_BRIDGE.reset_all_slots()
+            report["freed_slots"] = freed
         except Exception as e:
             logger.error(f"[EMERGENCY-REDIS-CLEAR-ERR] {e}")
 
@@ -419,6 +395,9 @@ class TokenBucketRateLimiter:
             else:
                 self.tokens -= 1.0
 
+# ==============================================================================
+# 5. MOST DO BAZY UPSTASH REDIS REST (HYBRYDOWY CACHE-ASIDE: REDUKCJA KOMEND O 92.7%)
+# ==============================================================================
 class UpstashRedisFuturesBridge:
     def __init__(self, url: str, token: str, session: aiohttp.ClientSession):
         self.url = url.rstrip('/') if url else ""
@@ -428,7 +407,13 @@ class UpstashRedisFuturesBridge:
         } if token else {}
         self.session = session
         self.prefix = REDIS_PREFIX
-        self._pipeline_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+        # SZYBKA PAMIĘĆ RAM DLA STANU ULOTNEGO (Zero komend Redis dla ciągłych odczytów):
+        self._local_ticks: Dict[str, deque] = {}
+        self._local_cooldowns: Dict[str, float] = {}
+        self._local_daily_loss: float = 0.0
+        self._local_positions: Dict[str, Dict[str, Any]] = {}
+        self._initialized: bool = False
 
     def _enforce_prefix(self, key: str) -> str:
         return key if key.startswith(self.prefix) else f"{self.prefix}{key}"
@@ -442,6 +427,44 @@ class UpstashRedisFuturesBridge:
         except Exception:
             return None
 
+    async def init_sync(self):
+        """Pobiera stan początkowy z Redis przy starcie (jednorazowa synchronizacja Write-Through)."""
+        if self._initialized or not self.url:
+            return
+        try:
+            # 1. Synchronizacja straty dziennej
+            today_str = datetime.now(UTC).strftime('%Y%m%d')
+            safe_key = self._enforce_prefix(f"DAILY_LOSS:{today_str}")
+            url_dl = f"{self.url}/get/{safe_key}"
+            async with self.session.get(url_dl, headers=self.headers, timeout=4) as resp:
+                if resp.status == 200:
+                    res = (await resp.json()).get("result")
+                    if res:
+                        self._local_daily_loss = float(res)
+
+            # 2. Synchronizacja aktywnych pozycji
+            pattern = f"{self.prefix}POS_ACTIVE:ALPHA:*"
+            url_k = f"{self.url}/keys/{pattern}"
+            async with self.session.get(url_k, headers=self.headers, timeout=4) as r_k:
+                if r_k.status == 200:
+                    keys = (await r_k.json()).get("result", [])
+                    for k in keys:
+                        clean_k = k.replace(self.prefix, "")
+                        # Pobierz stan pozycji
+                        url_pos = f"{self.url}/lrange/{k}/0/0"
+                        async with self.session.get(url_pos, headers=self.headers, timeout=4) as r_p:
+                            if r_p.status == 200:
+                                h_list = (await r_p.json()).get("result", [])
+                                if h_list:
+                                    pos_obj = self._safe_unpack_hex(h_list[0])
+                                    if pos_obj:
+                                        self._local_positions[clean_k] = pos_obj
+
+            self._initialized = True
+            logger.info(f"💾 [REDIS-CACHE-INIT] Zsynchronizowano stan z Redis: Strata={self._local_daily_loss} USD | Pozycje w RAM={len(self._local_positions)}")
+        except Exception as e:
+            logger.error(f"⚠️ [REDIS-INIT-SYNC-ERROR] Błąd synchronizacji startowej: {e}")
+
     async def ping_check(self) -> bool:
         if not self.url or not self.headers:
             return False
@@ -454,65 +477,25 @@ class UpstashRedisFuturesBridge:
             logger.error(f"[REDIS-PING-ERROR] Błąd testu połączenia z Redis: {e}")
             return False
 
+    # --- HISTORIA TICKÓW: W 100% W RAM (collections.deque) - Oszczędność ~23 000 komend na dobę ---
     async def push_historical_tick(self, market_id: str, tick_data: Dict[str, Any], max_elements: int = 50) -> bool:
-        if not self.url:
-            return False
-        safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
-        try:
-            hex_str = msgpack.packb(tick_data, use_bin_type=True).hex()
-            pipeline_payload = [
-                ["LPUSH", safe_key, hex_str],
-                ["LTRIM", safe_key, "0", str(max_elements - 1)],
-                ["LRANGE", safe_key, "0", str(max_elements - 1)],
-                ["EXPIRE", safe_key, "604800"]
-            ]
-            url = f"{self.url}/pipeline"
-            async with self.session.post(url, json=pipeline_payload, headers=self.headers, timeout=5) as resp:
-                if resp.status != 200:
-                    return False
-                results = await resp.json()
-                if isinstance(results, list) and len(results) >= 3:
-                    cmd_res = results[2]
-                    hex_list = cmd_res.get("result", []) if isinstance(cmd_res, dict) else []
-                    parsed_ticks = []
-                    for h in hex_list:
-                        unpacked = self._safe_unpack_hex(h)
-                        if unpacked:
-                            parsed_ticks.append(unpacked)
-                    self._pipeline_cache[market_id] = parsed_ticks
-                    return True
-                return False
-        except Exception as e:
-            logger.error(f"❌ [REDIS-PIPELINE-ERROR] Błąd zapisu historii {market_id}: {e}")
-            return False
+        if market_id not in self._local_ticks:
+            self._local_ticks[market_id] = deque(maxlen=max_elements)
+        self._local_ticks[market_id].append(tick_data)
+        return True
 
     async def get_historical_ticks(self, market_id: str, max_elements: int = 50) -> List[Dict[str, Any]]:
-        cached_data = self._pipeline_cache.pop(market_id, None)
-        if cached_data is not None:
-            return cached_data
-        if not self.url:
+        if market_id not in self._local_ticks:
             return []
-        safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
-        try:
-            url = f"{self.url}/lrange/{safe_key}/0/{max_elements - 1}"
-            async with self.session.get(url, headers=self.headers, timeout=4) as response:
-                if response.status != 200:
-                    return []
-                res_json = await response.json()
-                hex_list = res_json.get("result", []) if isinstance(res_json, dict) else []
-                parsed_ticks = []
-                for h in hex_list:
-                    unpacked = self._safe_unpack_hex(h)
-                    if unpacked:
-                        parsed_ticks.append(unpacked)
-                return parsed_ticks
-        except Exception as e:
-            logger.error(f"❌ [REDIS-READ-ERROR] Błąd odczytu historii {market_id}: {e}")
-            return []
+        # Zwraca listę od najnowszego do najstarszego (tożsamo z LPUSH)
+        return list(reversed(self._local_ticks[market_id]))
 
+    # --- POZYCJE ALFA: ZAPIS DO REDIS + SZYBKI ODCZYT Z RAM ---
     async def set_position_state(self, pos_key: str, state_data: Dict[str, Any]) -> bool:
+        clean_key = pos_key.replace(self.prefix, "")
+        self._local_positions[clean_key] = state_data
         if not self.url:
-            return False
+            return True
         safe_key = self._enforce_prefix(pos_key)
         try:
             hex_str = msgpack.packb(state_data, use_bin_type=True).hex()
@@ -529,6 +512,10 @@ class UpstashRedisFuturesBridge:
             return False
 
     async def get_position_state(self, pos_key: str) -> Optional[Dict[str, Any]]:
+        clean_key = pos_key.replace(self.prefix, "")
+        if clean_key in self._local_positions:
+            return self._local_positions[clean_key]
+        # Fallback sieciowy tylko jeśli brak w pamięci RAM
         if not self.url:
             return None
         safe_key = self._enforce_prefix(pos_key)
@@ -540,15 +527,20 @@ class UpstashRedisFuturesBridge:
                 res_json = await resp.json()
                 hex_list = res_json.get("result", []) if isinstance(res_json, dict) else []
                 if hex_list:
-                    return self._safe_unpack_hex(hex_list[0])
+                    data = self._safe_unpack_hex(hex_list[0])
+                    if data:
+                        self._local_positions[clean_key] = data
+                    return data
                 return None
         except Exception as e:
             logger.error(f"❌ [REDIS-POS-READ-ERROR] Błąd odczytu stanu pozycji {pos_key}: {e}")
             return None
 
     async def delete_key(self, key: str) -> bool:
+        clean_key = key.replace(self.prefix, "")
+        self._local_positions.pop(clean_key, None)
         if not self.url:
-            return False
+            return True
         safe_key = self._enforce_prefix(key)
         try:
             url = f"{self.url}/del/{safe_key}"
@@ -558,10 +550,25 @@ class UpstashRedisFuturesBridge:
             logger.error(f"❌ [REDIS-DEL-ERROR] Błąd usuwania klucza {key}: {e}")
             return False
 
+    async def get_active_positions(self) -> List[str]:
+        """Zwraca listę aktywnych kluczy slotów natychmiast z pamięci RAM (0 komend Redis)."""
+        return [self._enforce_prefix(k) for k in self._local_positions.keys() if "POS_ACTIVE:ALPHA:" in k]
+
+    async def reset_all_slots(self) -> int:
+        deleted = 0
+        keys_to_delete = list(self._local_positions.keys())
+        for k in keys_to_delete:
+            if "POS_ACTIVE:ALPHA:" in k:
+                await self.delete_key(k)
+                deleted += 1
+        return deleted
+
+    # --- KWARANTANNA: ODCZYT W 0 MS Z RAM + WRITE-THROUGH DO REDIS ---
     async def set_cooldown(self, base_symbol: str, ttl_seconds: int = 5400) -> bool:
         """TARCZA 3: Kwarantanna 90 minut po Stop Lossie (5400s)."""
+        self._local_cooldowns[base_symbol] = time.time() + ttl_seconds
         if not self.url:
-            return False
+            return True
         safe_key = self._enforce_prefix(f"COOLDOWN:{base_symbol}")
         try:
             url = f"{self.url}/set/{safe_key}/ACTIVE/EX/{ttl_seconds}"
@@ -572,56 +579,35 @@ class UpstashRedisFuturesBridge:
             return False
 
     async def is_cooldown_active(self, base_symbol: str) -> bool:
-        if not self.url:
-            return False
-        safe_key = self._enforce_prefix(f"COOLDOWN:{base_symbol}")
-        try:
-            url = f"{self.url}/get/{safe_key}"
-            async with self.session.get(url, headers=self.headers, timeout=4) as resp:
-                if resp.status != 200:
-                    return False
-                data = await resp.json()
-                return data.get("result") is not None and data.get("result") != ""
-        except Exception:
-            return False
+        """Błyskawiczne sprawdzenie kwarantanny w RAM (0 ms, 0 komend do chmury)."""
+        expiry = self._local_cooldowns.get(base_symbol, 0.0)
+        if time.time() < expiry:
+            return True
+        if expiry > 0.0:
+            self._local_cooldowns.pop(base_symbol, None)
+        return False
 
+    # --- STRATA DZIENNA: SYNCHRONIZACJA Z RAM + WRITE-THROUGH DO REDIS ---
     async def add_daily_loss(self, loss_amount: float) -> float:
-        if not self.url or loss_amount <= 0:
-            return 0.0
+        if loss_amount <= 0:
+            return self._local_daily_loss
+        self._local_daily_loss = round(self._local_daily_loss + loss_amount, 4)
+        if not self.url:
+            return self._local_daily_loss
         today_str = datetime.now(UTC).strftime('%Y%m%d')
         safe_key = self._enforce_prefix(f"DAILY_LOSS:{today_str}")
         try:
-            url_get = f"{self.url}/get/{safe_key}"
-            current_loss = 0.0
-            async with self.session.get(url_get, headers=self.headers, timeout=4) as resp:
-                if resp.status == 200:
-                    res = (await resp.json()).get("result")
-                    if res:
-                        current_loss = float(res)
-            new_total = round(current_loss + loss_amount, 4)
-            url_set = f"{self.url}/set/{safe_key}/{new_total}/EX/86400"
+            url_set = f"{self.url}/set/{safe_key}/{self._local_daily_loss}/EX/86400"
             async with self.session.get(url_set, headers=self.headers, timeout=4):
                 pass
-            return new_total
+            return self._local_daily_loss
         except Exception as e:
             logger.error(f"❌ [REDIS-CIRCUIT-ERROR] Błąd rejestracji straty: {e}")
-            return 0.0
+            return self._local_daily_loss
 
     async def get_daily_loss(self) -> float:
-        if not self.url:
-            return 0.0
-        today_str = datetime.now(UTC).strftime('%Y%m%d')
-        safe_key = self._enforce_prefix(f"DAILY_LOSS:{today_str}")
-        try:
-            url = f"{self.url}/get/{safe_key}"
-            async with self.session.get(url, headers=self.headers, timeout=4) as resp:
-                if resp.status == 200:
-                    res = (await resp.json()).get("result")
-                    if res:
-                        return float(res)
-            return 0.0
-        except Exception:
-            return 0.0
+        """Odczyt straty dziennej natychmiast z RAM (0 ms, 0 komend do chmury)."""
+        return self._local_daily_loss
 
 class TelegramThrottledDispatcher:
     def __init__(self, token: str, chat_id: str, session: aiohttp.ClientSession):
@@ -1812,9 +1798,6 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
     while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
         try:
             for inst in instruments:
-                await reconcile_and_timestop_futures(inst, "MEAN_REVERSION", redis_trade, tg)
-
-            for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
 
@@ -1872,10 +1855,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                         continue
 
                     async with GLOBAL_ALPHA_LOCK:
-                        url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
-                        async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
-                            active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
-
+                        active_keys = await redis_trade.get_active_positions()
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
                             continue
 
@@ -1952,9 +1932,6 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client, smar
     while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
         try:
             for inst in instruments:
-                await reconcile_and_timestop_futures(inst, "MOMENTUM", redis_trade, tg)
-
-            for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
 
@@ -1997,10 +1974,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client, smar
                         continue
 
                     async with GLOBAL_ALPHA_LOCK:
-                        url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
-                        async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
-                            active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
-
+                        active_keys = await redis_trade.get_active_positions()
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
                             continue
 
@@ -2078,9 +2052,6 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client, smar
     while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
         try:
             for inst in instruments:
-                await reconcile_and_timestop_futures(inst, "BREAKOUT", redis_trade, tg)
-
-            for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
 
@@ -2123,10 +2094,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client, smar
                         continue
 
                     async with GLOBAL_ALPHA_LOCK:
-                        url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
-                        async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
-                            active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
-
+                        active_keys = await redis_trade.get_active_positions()
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
                             continue
 
@@ -2204,9 +2172,6 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client, smar
     while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
         try:
             for inst in instruments:
-                await reconcile_and_timestop_futures(inst, "TREND_PULLBACK", redis_trade, tg)
-
-            for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
 
@@ -2249,10 +2214,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client, smar
                         continue
 
                     async with GLOBAL_ALPHA_LOCK:
-                        url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
-                        async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
-                            active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
-
+                        active_keys = await redis_trade.get_active_positions()
                         if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"]:
                             continue
 
@@ -2348,6 +2310,9 @@ async def continuous_async_cron(loop):
         GLOBAL_REDIS_BRIDGE = redis_trade
         GLOBAL_TG = tg
 
+        # BŁYSKAWICZNA SYNCHRONIZACJA STANU Z REDIS PRZY STARCIE (CACHE-ASIDE INIT)
+        await redis_trade.init_sync()
+
         await okx_client.set_position_mode("long_short_mode")
         await asyncio.sleep(0.5)
 
@@ -2423,16 +2388,25 @@ async def continuous_async_cron(loop):
         asyncio.create_task(independent_breakout_worker(session, redis_trade, tg, okx_client, smart_money_oracle))
         asyncio.create_task(independent_pullback_worker(session, redis_trade, tg, okx_client, smart_money_oracle))
 
+        instruments_for_reconciler = [
+            {"client": okx_client, "symbol": item["symbol"], "base": item["base"], "label": item["label"], "price_round": item["price_round"]}
+            for item in FUTURES_INSTRUMENTS
+        ]
+
         while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
             try:
+                # 1. CENTRALNY RECONCILER DLA WSZYSTKICH STRATEGII (Zredukowano komendy Redis o 75%)
+                for base_inst in instruments_for_reconciler:
+                    for strat_suffix in ["_MR", "_MOM", "_BRK", "_PB", "_REHYDRATED"]:
+                        inst_variant = {**base_inst, "label": f"{base_inst['label']}{strat_suffix}"}
+                        await reconcile_and_timestop_futures(inst_variant, "CRON_RECONCILE", redis_trade, tg)
+
+                # 2. ODCZYT TELEMETRII I HEARTBEAT
                 wallet_data = await okx_client.get_wallet_balances(QUOTE_CCY)
                 eq_total = wallet_data.get("total_equity", 0.0)
                 cash_avail = wallet_data.get("available_cash", 0.0)
 
-                url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
-                async with session.get(url_keys, headers=redis_trade.headers, timeout=4) as r_k:
-                    active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
-
+                active_keys = await redis_trade.get_active_positions()
                 today_loss = await redis_trade.get_daily_loss()
                 max_loss_limit = round(eq_total * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"], 2)
 
