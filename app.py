@@ -18,7 +18,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 # =========================================================================
-# SYSTEMOWY MODUŁ OBSERVABILITY & TELEMETRII (v12.0 FUTURES 3X / LIVE SHIELD)
+# SYSTEMOWY MODUŁ OBSERVABILITY & TELEMETRII (v13.0 FUTURES 3X / LIVE SHIELD)
 # =========================================================================
 try:
     if hasattr(sys.stdout, 'reconfigure'):
@@ -42,7 +42,7 @@ _stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(
 logger.addHandler(_stream_handler)
 logger.propagate = False
 
-IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
+IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "False").strip().lower() in ("true", "1", "yes")
 
 # INTELIGENTNY PRZEŁĄCZNIK ŚRODOWISKOWY:
 DEFAULT_CCY = "USD"
@@ -58,28 +58,32 @@ ASYNC_SHUTDOWN_EVENT: Optional[asyncio.Event] = None
 RATE_LIMITER: Optional[Any] = None
 GLOBAL_WS_FEED: Optional[Any] = None
 
-# Oficjalne instrumenty X-Perp / FUTURES wykryte na koncie OKX EEA pod uprawnienie Expiry
+# Oficjalne instrumenty X-Perp na rynku LIVE OKX Europe (EEA) pod uprawnienie Expiry (seria 5-letnia -310404)
 FUTURES_INSTRUMENTS = [
     {
-        "symbol": "BTC-USD_UM_XPERP-310328",
+        "symbol": "BTC-USD_UM_XPERP-310404" if not IS_SANDBOX else "BTC-USD_UM_XPERP-310328",
+        "family": "BTC-USD_UM_XPERP",
         "base": "BTC",
         "label": "BTC_USD_XPERP",
         "price_round": 2
     },
     {
-        "symbol": "ETH-USD_UM_XPERP-310328",
+        "symbol": "ETH-USD_UM_XPERP-310404" if not IS_SANDBOX else "ETH-USD_UM_XPERP-310328",
+        "family": "ETH-USD_UM_XPERP",
         "base": "ETH",
         "label": "ETH_USD_XPERP",
         "price_round": 2
     },
     {
-        "symbol": "SOL-USD_UM-260925",
+        "symbol": "SOL-USD_UM_XPERP-310404" if not IS_SANDBOX else "SOL-USD_UM-260925",
+        "family": "SOL-USD_UM_XPERP",
         "base": "SOL",
         "label": "SOL_USD_FUT",
         "price_round": 2
     },
     {
-        "symbol": "XRP-USD_UM_XPERP-310801",
+        "symbol": "XRP-USD_UM_XPERP-310404" if not IS_SANDBOX else "XRP-USD_UM_XPERP-310801",
+        "family": "XRP-USD_UM_XPERP",
         "base": "XRP",
         "label": "XRP_USD_XPERP",
         "price_round": 4
@@ -100,10 +104,10 @@ CONFIG = {
         "BREAK_EVEN_FEE_BUFFER_PCT": 0.0010 # +0.10% buforu na prowizje maklerskie OKX
     },
     "TIMEOUTS": {
-        "MOMENTUM": 3 * 3600,        # Zoptymalizowano do 3h dla strategii impulsowych
-        "BREAKOUT": 3 * 3600,        # Zoptymalizowano do 3h dla wybicia zmienności
-        "TREND_PULLBACK": 6 * 3600,  # 6 godzin dla wejścia z trendem
-        "MEAN_REVERSION": 8 * 3600   # 8 godzin dla powrotu do średniej
+        "MOMENTUM": 3 * 3600,        # 3h dla strategii impulsowych
+        "BREAKOUT": 3 * 3600,        # 3h dla wybicia zmienności
+        "TREND_PULLBACK": 6 * 3600,  # 6h dla wejścia z trendem
+        "MEAN_REVERSION": 8 * 3600   # 8h dla powrotu do średniej
     },
     "SAFETY_GUARDS": {
         "SL_COOLDOWN_SECONDS": 45 * 60,      # 45 minut kwarantanny po uderzeniu w Stop Loss
@@ -234,6 +238,7 @@ def scan_xperp_instruments_endpoint():
                             if any(c in inst_id.upper() or c in uly.upper() for c in ["BTC", "ETH", "SOL", "XRP"]):
                                 futures_results.append({
                                     "instId": inst_id,
+                                    "instFamily": item.get("instFamily"),
                                     "uly": uly,
                                     "settleCcy": item.get("settleCcy"),
                                     "ctVal": item.get("ctVal"),
@@ -246,25 +251,11 @@ def scan_xperp_instruments_endpoint():
             except Exception as e:
                 futures_results = [{"error": str(e)}]
 
-            url_swap = f"{base_url}/api/v5/public/instruments?instType=SWAP"
-            swap_results = []
-            try:
-                async with session.get(url_swap, headers=headers, timeout=8) as r_swap:
-                    swap_data = await r_swap.json()
-                    if swap_data.get("code") == "0":
-                        for item in swap_data.get("data", []):
-                            inst_id = item.get("instId", "")
-                            if any(c in inst_id.upper() for c in ["BTC", "ETH", "SOL", "XRP"]):
-                                swap_results.append(inst_id)
-            except Exception as e:
-                swap_results = [str(e)]
-
             return {
                 "jurisdiction": "OKX_EEA_EUROPE",
                 "mode": "SANDBOX_DEMO" if IS_SANDBOX else "LIVE_PRODUCTION",
                 "futures_xperp_count": len(futures_results),
-                "futures_xperp_instruments": futures_results,
-                "swap_available_in_region": swap_results[:10]
+                "futures_xperp_instruments": futures_results
             }
 
     fut = asyncio.run_coroutine_threadsafe(_perform_scan(), BACKGROUND_LOOP)
@@ -744,7 +735,7 @@ class OKXSmartMoneyOracle:
     Odpytuje publiczne endpointy danych instytucjonalnych o wolumenie Taker Buy/Sell
     oraz proporcji pozycji rynkowych, chroniąc przed pułapkami płynnościowymi (Liquidity Grabs).
     """
-    def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter, is_sandbox: bool = True):
+    def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter, is_sandbox: bool = False):
         self.session = session
         self.rate_limiter = rate_limiter
         self.is_sandbox = is_sandbox
@@ -833,7 +824,7 @@ class OKXSmartMoneyOracle:
         return True, "SM_ALIGNED", flow
 
 class OKXWebSocketPriceFeed:
-    def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = True):
+    def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = False):
         self.session = session
         self.is_sandbox = is_sandbox
         self.ws_endpoints = [
@@ -924,7 +915,7 @@ class OKXWebSocketPriceFeed:
 
 class OKXFuturesClient:
     """Wyspecjalizowany klient OKX API V5 dla rynku SWAP i FUTURES (X-Perp) z lewarem 3x."""
-    def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter, is_sandbox: bool = True):
+    def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter, is_sandbox: bool = False):
         self.base_url = os.environ.get("OKX_API_URL", "https://eea.okx.com").rstrip('/')
         self.session = session
         self.rate_limiter = rate_limiter
@@ -991,8 +982,32 @@ class OKXFuturesClient:
             logger.error(f"[FUTURES-CONFIG] Błąd trybu pozycji: {e}")
             return False
 
+    async def auto_resolve_xperp_symbol(self, family_or_symbol: str) -> str:
+        """Dynamicznie weryfikuje i dopasowuje aktualny identyfikator X-Perp na giełdzie."""
+        await self.rate_limiter.consume()
+        request_path = "/api/v5/public/instruments?instType=FUTURES"
+        url = f"{self.base_url}{request_path}"
+        headers = {"Content-Type": "application/json"}
+        if self.is_sandbox:
+            headers["x-simulated-trading"] = "1"
+        try:
+            async with self.session.get(url, headers=headers, timeout=6) as resp:
+                data = await resp.json()
+                if data.get("code") == "0" and data.get("data"):
+                    clean_target = family_or_symbol.split('-')[0].upper()
+                    for item in data["data"]:
+                        inst_id = item.get("instId", "")
+                        inst_fam = item.get("instFamily", "")
+                        state = item.get("state", "")
+                        if state == "live" and clean_target in inst_id.upper() and "XPERP" in inst_id.upper():
+                            logger.info(f"🎯 [AUTO-DISCOVERY] Dopasowano dynamicznie symbol Live: {inst_id} (rodzina: {inst_fam})")
+                            return inst_id
+        except Exception as e:
+            logger.warning(f"⚠️ [AUTO-DISCOVERY-FALLBACK] Błąd dynamicznego skanowania: {e}")
+        return family_or_symbol
+
     async def load_instrument_specification(self, symbol: str) -> Optional[Dict[str, Any]]:
-        types_to_check = ["SWAP", "FUTURES"]
+        types_to_check = ["FUTURES", "SWAP"]
         for inst_type in types_to_check:
             for attempt in range(2):
                 await self.rate_limiter.consume()
@@ -2387,6 +2402,14 @@ async def continuous_async_cron(loop):
         # 1. Konfiguracja konta przy starcie
         await okx_client.set_position_mode("long_short_mode")
         await asyncio.sleep(0.5)
+
+        # 1.1. Dynamiczna weryfikacja i rozwiązywanie aktualnych identyfikatorów instrumentów
+        for item in FUTURES_INSTRUMENTS:
+            resolved_id = await okx_client.auto_resolve_xperp_symbol(item["symbol"])
+            if resolved_id and resolved_id != item["symbol"]:
+                logger.info(f"🔄 [SYMBOL-RESOLVED] Podmieniono {item['symbol']} -> {resolved_id}")
+                item["symbol"] = resolved_id
+
         symbols_to_stream = [item["symbol"] for item in FUTURES_INSTRUMENTS]
         for sym in symbols_to_stream:
             spec = await okx_client.load_instrument_specification(sym)
