@@ -41,7 +41,7 @@ logger.propagate = False
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "False").strip().lower() in ("true", "1", "yes")
 
 # INTELIGENTNY PRZEŁĄCZNIK ŚRODOWISKOWY:
-DEFAULT_CCY = "USD"
+DEFAULT_CCY = "USDC" if not IS_SANDBOX else "USD"
 QUOTE_CCY = os.environ.get("QUOTE_CCY", DEFAULT_CCY).strip().upper()
 TARGET_LEVERAGE = 3
 TARGET_MARGIN_MODE = "isolated"
@@ -1044,6 +1044,7 @@ class OKXFuturesClient:
         return False
 
     async def get_wallet_balances(self, preferred_ccy: str = QUOTE_CCY) -> Dict[str, Any]:
+        """Pancerny odczyt salda wspierający Single-Currency, Multi-Currency i Unified Margin na OKX Europe."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}}
         await self.rate_limiter.consume()
@@ -1051,39 +1052,81 @@ class OKXFuturesClient:
         url = f"{self.base_url}{request_path}"
         headers = self._get_headers("GET", request_path)
         try:
-            async with self.session.get(url, headers=headers, timeout=5) as resp:
+            async with self.session.get(url, headers=headers, timeout=6) as resp:
                 data = await resp.json()
-                if data.get("code") == "0" and data.get("data"):
-                    acc = data["data"][0]
-                    total_eq = float(acc.get("totalEq", 0.0))
-                    balances_map = {}
-                    for b in acc.get("details", []):
-                        c = b.get("ccy", "")
-                        # Pancerne odczytywanie gotówki: wspiera availBal, availEq i cashBal!
-                        avail_v = float(b.get("availBal") or b.get("availEq") or b.get("cashBal") or 0.0)
-                        balances_map[c] = {
-                            "availBal": avail_v,
-                            "eq": float(b.get("eq", 0.0))
-                        }
+                code = str(data.get("code", "-1"))
+                if code != "0":
+                    err_msg = data.get("msg", "Nieznany błąd autoryzacji salda")
+                    logger.error(f"❌ [OKX-WALLET-REJECTED] Błąd salda: {err_msg} (kod: {code}) | HTTP: {resp.status}")
+                    return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}, "error": err_msg}
 
+                if data.get("data") and len(data["data"]) > 0:
+                    acc = data["data"][0]
+                    total_eq_raw = acc.get("totalEq")
+                    try:
+                        total_eq = float(total_eq_raw) if total_eq_raw and str(total_eq_raw).strip() != "" else 0.0
+                    except (ValueError, TypeError):
+                        total_eq = 0.0
+
+                    balances_map = {}
+                    sum_eq = 0.0
+                    sum_avail = 0.0
+
+                    def _parse_num(val) -> float:
+                        if val is None or str(val).strip() == "":
+                            return 0.0
+                        try:
+                            return float(val)
+                        except (ValueError, TypeError):
+                            return 0.0
+
+                    for b in acc.get("details", []):
+                        c = b.get("ccy", "").upper()
+                        avail_b = _parse_num(b.get("availBal"))
+                        avail_e = _parse_num(b.get("availEq"))
+                        cash_b = _parse_num(b.get("cashBal"))
+                        eq_b = _parse_num(b.get("eq"))
+
+                        best_avail = avail_e if avail_e > 0 else (avail_b if avail_b > 0 else cash_b)
+                        best_eq = eq_b if eq_b > 0 else best_avail
+
+                        balances_map[c] = {
+                            "availBal": best_avail,
+                            "eq": best_eq,
+                            "cashBal": cash_b,
+                            "availEq": avail_e
+                        }
+                        sum_eq += best_eq
+                        sum_avail += best_avail
+
+                    # Jeśli w trybie Single-Currency totalEq w USD było puste (""), używamy sumy z details:
+                    if total_eq <= 0.0 and sum_eq > 0.0:
+                        total_eq = sum_eq
+
+                    # Poszukiwanie gotówki w preferowanych walutach:
                     avail_cash = 0.0
                     for check_c in [preferred_ccy, "USDC", "USD", "USDT"]:
                         if check_c in balances_map and balances_map[check_c]["availBal"] > 0:
                             avail_cash = balances_map[check_c]["availBal"]
                             break
 
-                    if avail_cash == 0.0 and total_eq > 0:
-                        avail_cash = total_eq
+                    if avail_cash <= 0.0:
+                        if sum_avail > 0.0:
+                            avail_cash = sum_avail
+                        elif total_eq > 0.0:
+                            avail_cash = total_eq
 
                     return {
-                        "total_equity": total_eq,
-                        "available_cash": avail_cash,
+                        "total_equity": round(total_eq, 2),
+                        "available_cash": round(avail_cash, 2),
                         "preferred_ccy": preferred_ccy,
                         "balances": balances_map
                     }
-                return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}}
+                else:
+                    logger.warning(f"⚠️ [OKX-WALLET-EMPTY] Odpowiedź /api/v5/account/balance ma pustą tablicę 'data': {data}")
+                    return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}}
         except Exception as e:
-            logger.error(f"❌ [OKX-WALLET] Błąd salda: {e}")
+            logger.error(f"❌ [OKX-WALLET-EXCEPTION] Błąd pobierania salda: {e}")
             return {"total_equity": 0.0, "available_cash": 0.0, "balances": {}}
 
     def calculate_contract_size(
@@ -1636,7 +1679,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                 daily_loss = await redis_trade.get_daily_loss()
                 wallet_check = await inst["client"].get_wallet_balances(QUOTE_CCY)
                 equity_check = wallet_check.get("total_equity", 360.0)
-                if daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
+                if equity_check > 0 and daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
                     continue
 
                 spread_ok, _ = await inst["client"].check_spread_allowed(inst["symbol"], CONFIG["SAFETY_GUARDS"]["MAX_SPREAD_PCT"])
@@ -1762,7 +1805,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client, smar
                 daily_loss = await redis_trade.get_daily_loss()
                 wallet_check = await inst["client"].get_wallet_balances(QUOTE_CCY)
                 equity_check = wallet_check.get("total_equity", 360.0)
-                if daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
+                if equity_check > 0 and daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
                     continue
 
                 spread_ok, _ = await inst["client"].check_spread_allowed(inst["symbol"], CONFIG["SAFETY_GUARDS"]["MAX_SPREAD_PCT"])
@@ -1874,7 +1917,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client, smar
                 daily_loss = await redis_trade.get_daily_loss()
                 wallet_check = await inst["client"].get_wallet_balances(QUOTE_CCY)
                 equity_check = wallet_check.get("total_equity", 360.0)
-                if daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
+                if equity_check > 0 and daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
                     continue
 
                 spread_ok, _ = await inst["client"].check_spread_allowed(inst["symbol"], CONFIG["SAFETY_GUARDS"]["MAX_SPREAD_PCT"])
@@ -1986,7 +2029,7 @@ async def independent_pullback_worker(session, redis_trade, tg, okx_client, smar
                 daily_loss = await redis_trade.get_daily_loss()
                 wallet_check = await inst["client"].get_wallet_balances(QUOTE_CCY)
                 equity_check = wallet_check.get("total_equity", 360.0)
-                if daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
+                if equity_check > 0 and daily_loss >= (equity_check * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]):
                     continue
 
                 spread_ok, _ = await inst["client"].check_spread_allowed(inst["symbol"], CONFIG["SAFETY_GUARDS"]["MAX_SPREAD_PCT"])
@@ -2114,7 +2157,7 @@ async def continuous_async_cron(loop):
             if spec:
                 logger.info(f"🛡️ [LEVERAGE-STATUS] {sym} | Dźwignia 3x [LONG: {lev_l}, SHORT: {lev_s}]")
 
-        # REHYDRATION
+        # REHYDRATION Z PEŁNĄ DIAGNOSTYKĄ
         try:
             logger.info("🔍 [REHYDRATION] Sprawdzanie otwartych pozycji na giełdzie po restarcie...")
             await okx_client.rate_limiter.consume()
@@ -2122,7 +2165,9 @@ async def continuous_async_cron(loop):
             headers_p = okx_client._get_headers("GET", pos_req_path)
             async with session.get(f"{okx_client.base_url}{pos_req_path}", headers=headers_p, timeout=6) as r_p:
                 p_data = await r_p.json()
-                if p_data.get("code") == "0" and p_data.get("data"):
+                if p_data.get("code") != "0":
+                    logger.error(f"⚠️ [REHYDRATION-API-ERROR] Błąd sprawdzania pozycji: {p_data.get('msg')} (kod: {p_data.get('code')})")
+                elif p_data.get("code") == "0" and p_data.get("data"):
                     for pos_item in p_data["data"]:
                         pos_sz = float(pos_item.get("pos", 0.0))
                         pos_inst = pos_item.get("instId")
@@ -2153,126 +2198,62 @@ async def continuous_async_cron(loop):
         except Exception as exc_rehyd:
             logger.error(f"⚠️ [REHYDRATION-FAILED] {exc_rehyd}")
 
-        await tg.push(f"🚀 <b>Silnik Futures 3x Online ({QUOTE_CCY})! [PREFIKS: {REDIS_PREFIX} | PANCERZ LIVE: 100%]</b>")
+        await tg.push(
+            f"🚀 <b>Silnik Futures 3x Online ({QUOTE_CCY})! [PREFIKS: {REDIS_PREFIX}]</b>\n"
+            f"Sloty: {CONFIG['ALPHA_MAX_ACTIVE_SLOTS']} | Dźwignia: 3x Izolowana\n"
+            f"Gotowy do handlu."
+        )
 
-        tasks = [
-            asyncio.create_task(ws_feed.start_listener(symbols_to_stream)),
-            asyncio.create_task(independent_mean_reversion_worker(session, redis_trade, tg, okx_client, smart_money_oracle)),
-            asyncio.create_task(independent_momentum_worker(session, redis_trade, tg, okx_client, smart_money_oracle)),
-            asyncio.create_task(independent_breakout_worker(session, redis_trade, tg, okx_client, smart_money_oracle)),
-            asyncio.create_task(independent_pullback_worker(session, redis_trade, tg, okx_client, smart_money_oracle))
-        ]
+        asyncio.create_task(ws_feed.start_listener(symbols_to_stream))
+        asyncio.create_task(independent_mean_reversion_worker(session, redis_trade, tg, okx_client, smart_money_oracle))
+        asyncio.create_task(independent_momentum_worker(session, redis_trade, tg, okx_client, smart_money_oracle))
+        asyncio.create_task(independent_breakout_worker(session, redis_trade, tg, okx_client, smart_money_oracle))
+        asyncio.create_task(independent_pullback_worker(session, redis_trade, tg, okx_client, smart_money_oracle))
 
-        heartbeat_timer = 0
-        try:
-            while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
-                await asyncio.sleep(1)
-                heartbeat_timer += 1
-                if heartbeat_timer >= 60:
-                    heartbeat_timer = 0
-                    prices_count = len(ws_feed.latest_prices)
-                    wallet = await okx_client.get_wallet_balances(QUOTE_CCY)
-                    eq = wallet.get("total_equity", 0.0)
-                    avail = wallet.get("available_cash", 0.0)
-                    d_loss = await redis_trade.get_daily_loss()
-                    max_d_loss = round(eq * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"], 2)
+        while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
+            try:
+                wallet_data = await okx_client.get_wallet_balances(QUOTE_CCY)
+                eq_total = wallet_data.get("total_equity", 0.0)
+                cash_avail = wallet_data.get("available_cash", 0.0)
 
-                    url_k = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
-                    async with session.get(url_k, headers=redis_trade.headers, timeout=3) as r_k:
-                        active_slots_count = len((await r_k.json()).get("result", [])) if r_k.status == 200 else 0
+                url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
+                async with session.get(url_keys, headers=redis_trade.headers, timeout=4) as r_k:
+                    active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
 
-                    cb_status = "🛑 BLOKADA" if d_loss >= max_d_loss and max_d_loss > 0 else "🟢 OK"
-                    logger.info(
-                        f"💓 [HEARTBEAT] Strumień: {prices_count}/4 | Kapitał: {eq} {QUOTE_CCY} | "
-                        f"Wolne: {avail} | Sloty: {active_slots_count}/3 | Strata dziś: {d_loss}/{max_d_loss} [{cb_status}]"
-                    )
-        except Exception as e:
-            logger.error(f"❌ [CRON-FATAL] {e}")
-        finally:
-            for t in tasks:
-                t.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                today_loss = await redis_trade.get_daily_loss()
+                max_loss_limit = round(eq_total * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"], 2)
 
-def background_scheduler_thread():
+                status_flag = "🟢 OK"
+                if today_loss >= max_loss_limit and max_loss_limit > 0:
+                    status_flag = "🛑 CIRCUIT-BREAKER"
+                elif cash_avail < CONFIG["MIN_ORDER_VALUE_QUOTE"]:
+                    status_flag = "⚠️ NISKI KAPITAŁ"
+
+                logger.info(
+                    f"💓 [HEARTBEAT] Strumień: 4/4 | Kapitał: {eq_total} USD | Wolne: {cash_avail} | "
+                    f"Sloty: {len(active_keys)}/{CONFIG['ALPHA_MAX_ACTIVE_SLOTS']} | "
+                    f"Strata dziś: {today_loss}/{max_loss_limit} [{status_flag}]"
+                )
+            except Exception as e:
+                logger.error(f"[HEARTBEAT-CHECK-ERROR] {e}")
+
+            await asyncio.sleep(60)
+
+def start_background_loop():
     global BACKGROUND_LOOP
     loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     BACKGROUND_LOOP = loop
+    asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(continuous_async_cron(loop))
     except Exception as e:
-        logger.error(f"[THREAD FAILURE] {e}")
+        logger.critical(f"💥 [CRITICAL-FATAL] Pętla bota padła: {e}")
     finally:
         loop.close()
 
-@app.route('/test-futures-env', methods=['GET'])
-def web_test_futures_environment():
-    async def _run_diag():
-        async with aiohttp.ClientSession() as session:
-            limiter = TokenBucketRateLimiter()
-            client = OKXFuturesClient(session, limiter, is_sandbox=IS_SANDBOX)
-            redis_bridge = UpstashRedisFuturesBridge(
-                os.environ.get("UPSTASH_REDIS_REST_URL", ""),
-                os.environ.get("UPSTASH_REDIS_REST_TOKEN", ""),
-                session
-            )
-            redis_pong = await redis_bridge.ping_check()
-            auth_status = await client.test_auth_handshake()
-            balance = await client.get_wallet_balances(QUOTE_CCY)
-            d_loss = await redis_bridge.get_daily_loss()
+bg_thread = threading.Thread(target=start_background_loop, daemon=True, name="FuturesEngineThread")
+bg_thread.start()
 
-            pattern = f"{redis_bridge.prefix}POS_ACTIVE:ALPHA:*"
-            url_k = f"{redis_bridge.url}/keys/{pattern}"
-            async with session.get(url_k, headers=redis_bridge.headers, timeout=4) as r_k:
-                raw_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
-
-            instruments_report = []
-            for item in FUTURES_INSTRUMENTS:
-                sym = item["symbol"]
-                spec = await client.load_instrument_specification(sym)
-                ticker = await client.get_market_ticker(sym)
-                instruments_report.append({
-                    "symbol": sym,
-                    "spec_loaded": spec is not None,
-                    "ct_val": spec["ctVal"] if spec else None,
-                    "current_price": ticker["last"] if ticker else 0.0
-                })
-
-            return {
-                "system": f"OKX_FUTURES_3X_ENGINE_{QUOTE_CCY}",
-                "mode": "SANDBOX" if IS_SANDBOX else "LIVE_PRODUCTION",
-                "redis_prefix": redis_bridge.prefix,
-                "redis_connected": redis_pong,
-                "daily_loss_accumulated": d_loss,
-                "active_redis_slots": raw_keys,
-                "okx_auth": auth_status,
-                "wallet_balance": balance,
-                "instruments": instruments_report
-            }
-
-    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
-        return jsonify({"status": "error", "message": "Pętla bota nie jest gotowa."}), 503
-
-    fut = asyncio.run_coroutine_threadsafe(_run_diag(), BACKGROUND_LOOP)
-    try:
-        return jsonify({"status": "success", "diagnostics": fut.result(timeout=25)}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-if __name__ == "__main__":
-    worker_thread = threading.Thread(target=background_scheduler_thread, daemon=True)
-    worker_thread.start()
-
-    def main_thread_shutdown_handler(signum, frame):
-        logger.warning(f"🛑 [SIGTERM/SIGINT] Zatrzymywanie Silnika Futures 3x (sygnał {signum})...")
-        if BACKGROUND_LOOP and ASYNC_SHUTDOWN_EVENT:
-            BACKGROUND_LOOP.call_soon_threadsafe(ASYNC_SHUTDOWN_EVENT.set)
-        time.sleep(1.5)
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, main_thread_shutdown_handler)
-    signal.signal(signal.SIGINT, main_thread_shutdown_handler)
-
+if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
