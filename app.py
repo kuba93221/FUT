@@ -556,25 +556,25 @@ class UpstashRedisFuturesBridge:
                 deleted += 1
         return deleted
 
-    async def set_cooldown(self, base_symbol: str, ttl_seconds: int = 5400) -> bool:
-        self._local_cooldowns[base_symbol] = time.time() + ttl_seconds
+    async def set_cooldown(self, base_symbol_or_key: str, ttl_seconds: int = 4500) -> bool:
+        self._local_cooldowns[base_symbol_or_key] = time.time() + ttl_seconds
         if not self.url:
             return True
-        safe_key = self._enforce_prefix(f"COOLDOWN:{base_symbol}")
+        safe_key = self._enforce_prefix(f"COOLDOWN:{base_symbol_or_key}")
         try:
             url = f"{self.url}/set/{safe_key}/ACTIVE/EX/{ttl_seconds}"
             async with self.session.get(url, headers=self.headers, timeout=4) as resp:
                 return resp.status == 200
         except Exception as e:
-            logger.error(f"❌ [REDIS-COOLDOWN-ERROR] Błąd kwarantanny {base_symbol}: {e}")
+            logger.error(f"❌ [REDIS-COOLDOWN-ERROR] Błąd kwarantanny {base_symbol_or_key}: {e}")
             return False
 
-    async def is_cooldown_active(self, base_symbol: str) -> bool:
-        expiry = self._local_cooldowns.get(base_symbol, 0.0)
+    async def is_cooldown_active(self, base_symbol_or_key: str) -> bool:
+        expiry = self._local_cooldowns.get(base_symbol_or_key, 0.0)
         if time.time() < expiry:
             return True
         if expiry > 0.0:
-            self._local_cooldowns.pop(base_symbol, None)
+            self._local_cooldowns.pop(base_symbol_or_key, None)
         return False
 
     async def add_daily_loss(self, loss_amount: float) -> float:
