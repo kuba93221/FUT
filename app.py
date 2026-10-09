@@ -52,8 +52,53 @@ QUOTE_CCY = os.environ.get("QUOTE_CCY", DEFAULT_CCY).strip().upper()
 TARGET_LEVERAGE = 3
 TARGET_MARGIN_MODE = "isolated"
 
-EMERGENCY_SECRET = os.environ.get("EMERGENCY_SECRET", "safe-kill-secret-2026").strip()
+# [B1 & B2 Fix] Brak domyślnego hasła. Wymuszenie bezpiecznego sekretu z env
+EMERGENCY_SECRET = os.environ.get("EMERGENCY_SECRET", "").strip()
+if not EMERGENCY_SECRET or len(EMERGENCY_SECRET) < 16:
+    if not IS_SANDBOX:
+        logger.critical("🚨 [FATAL-CONFIG] Brak bezpiecznego EMERGENCY_SECRET (min. 16 znaków) w zmiennych środowiskowych!")
+        sys.exit(1)
+    else:
+        logger.warning("⚠️ [SANDBOX-CONFIG] Użycie awaryjnego sekretu testowego w trybie sandbox.")
+        EMERGENCY_SECRET = "sandbox-safe-kill-secret-2026"
+
 REDIS_PREFIX = "FUTURES_3X_DEMO_" if IS_SANDBOX else "FUTURES_3X_LIVE_"
+
+# Helper: precyzyjny TTL do godziny 00:00:00 UTC najbliższej doby
+def get_seconds_until_midnight_utc() -> int:
+    now = datetime.now(UTC)
+    midnight = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+    diff = int((midnight - now).total_seconds()) + 1
+    return max(60, diff)
+
+class TokenBucketRateLimiter:
+    """[Concurrency & Rate Limiting] Deterministyczny Token Bucket z rezerwacją tokenów."""
+    def __init__(self, tokens_per_second: float = 4.0, max_capacity: float = 8.0):
+        self.rate = tokens_per_second
+        self.capacity = max_capacity
+        self.tokens = max_capacity
+        self.last_check = time.monotonic()
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _ensure_lock(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+
+    async def consume(self):
+        self._ensure_lock()
+        wait_time = 0.0
+        async with self._lock:
+            now = time.monotonic()
+            self.tokens = min(self.capacity, self.tokens + (now - self.last_check) * self.rate)
+            self.last_check = now
+            if self.tokens < 1.0:
+                wait_time = (1.0 - self.tokens) / self.rate
+                self.tokens = 0.0
+                self.last_check = now + wait_time
+            else:
+                self.tokens -= 1.0
+        if wait_time > 0.0:
+            await asyncio.sleep(wait_time)
 
 logger.info(f"⚙️ [SYSTEM-INIT] Silnik Futures 3x v17.8-HOTFIX Online [QUOTE: {QUOTE_CCY} | PREFIKS: {REDIS_PREFIX} | SANDBOX: {IS_SANDBOX}]")
 
@@ -281,12 +326,13 @@ app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 def require_admin() -> bool:
+    """[B1, B2, B3 Fix] Autoryzacja WYŁĄCZNIE przez nagłówek X-Admin-Secret z kodowaniem bajtów."""
     if not EMERGENCY_SECRET:
         return False
     supplied = request.headers.get("X-Admin-Secret", "").strip()
     if not supplied:
-        supplied = request.args.get("secret", "").strip() or request.form.get("secret", "").strip()
-    return hmac.compare_digest(supplied, EMERGENCY_SECRET)
+        return False
+    return hmac.compare_digest(supplied.encode("utf-8"), EMERGENCY_SECRET.encode("utf-8"))
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -485,6 +531,7 @@ def emergency_liquidate_endpoint():
 
             report = {"closed_positions": [], "canceled_pending": [], "canceled_algos": [], "freed_slots": 0, "verified_flat": False}
             
+            # [D12 Fix] KROK 1: Anulowanie zwykłych zleceń oczekujących
             for item in FUTURES_INSTRUMENTS:
                 sym = item["symbol"]
                 try:
@@ -505,6 +552,17 @@ def emergency_liquidate_endpoint():
                 except Exception as e:
                     logger.error(f"[EMERGENCY-CANCEL-PENDING] {sym}: {e}")
 
+            # [D12 Fix] KROK 2: NATYCHMIASTOWY ZRZUT POZYCJI PRZED ANULOWANIEM OCO
+            for item in FUTURES_INSTRUMENTS:
+                sym = item["symbol"]
+                for side in ["long", "short"]:
+                    flattened = await GLOBAL_OKX_CLIENT.emergency_flatten_position(sym, side)
+                    if flattened:
+                        report["closed_positions"].append(f"{sym}:{side}")
+
+            # [D12 Fix] KROK 3: Dopiero po zrzucie pozycji anulujemy zlecenia OCO
+            for item in FUTURES_INSTRUMENTS:
+                sym = item["symbol"]
                 try:
                     pending_algos = await GLOBAL_OKX_CLIENT.get_pending_algo_orders(sym, ord_type="oco")
                     if pending_algos:
@@ -515,13 +573,6 @@ def emergency_liquidate_endpoint():
                                 report["canceled_algos"].append(f"{sym}:{al_id}")
                 except Exception as e:
                     logger.error(f"[EMERGENCY-CANCEL-ALGO] {sym}: {e}")
-
-            for item in FUTURES_INSTRUMENTS:
-                sym = item["symbol"]
-                for side in ["long", "short"]:
-                    flattened = await GLOBAL_OKX_CLIENT.emergency_flatten_position(sym, side)
-                    if flattened:
-                        report["closed_positions"].append(f"{sym}:{side}")
 
             all_flat = True
             for item in FUTURES_INSTRUMENTS:
@@ -556,34 +607,6 @@ def emergency_liquidate_endpoint():
         return jsonify({"status": "COMPLETED" if res.get("verified_flat") else "FAILED_NOT_FLAT", "details": res}), code
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-
-class TokenBucketRateLimiter:
-    def __init__(self, tokens_per_second: float = 4.0, max_capacity: float = 8.0):
-        self.rate = tokens_per_second
-        self.capacity = max_capacity
-        self.tokens = max_capacity
-        self.last_check = time.monotonic()
-        self._lock: Optional[asyncio.Lock] = None
-
-    def _ensure_lock(self):
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-
-    async def consume(self):
-        self._ensure_lock()
-        wait_time = 0.0
-        async with self._lock:
-            now = time.monotonic()
-            self.tokens = min(self.capacity, self.tokens + (now - self.last_check) * self.rate)
-            self.last_check = now
-            if self.tokens < 1.0:
-                wait_time = (1.0 - self.tokens) / self.rate
-                self.tokens = 0.0
-                self.last_check = now + wait_time
-            else:
-                self.tokens -= 1.0
-        if wait_time > 0.0:
-            await asyncio.sleep(wait_time)
 
 class UpstashRedisFuturesBridge:
     def __init__(self, url: str, token: str, session: aiohttp.ClientSession):
@@ -649,8 +672,21 @@ class UpstashRedisFuturesBridge:
                                     if pos_obj:
                                         self._local_positions[clean_k] = pos_obj
 
+            # [D9 Fix] Odzyskiwanie kwarantann i cooldownów z bazy Redis po restarcie
+            pattern_cd = f"{self.prefix}COOLDOWN:*"
+            async with self.session.get(f"{self.url}/keys/{pattern_cd}", headers=self.headers, timeout=4) as r_cd:
+                if r_cd.status == 200:
+                    cd_keys = (await r_cd.json()).get("result", [])
+                    for k in cd_keys:
+                        clean_cd = k.replace(f"{self.prefix}COOLDOWN:", "")
+                        async with self.session.get(f"{self.url}/ttl/{k}", headers=self.headers, timeout=4) as r_ttl:
+                            if r_ttl.status == 200:
+                                ttl_val = (await r_ttl.json()).get("result", 0)
+                                if ttl_val and int(ttl_val) > 0:
+                                    self._local_cooldowns[clean_cd] = time.time() + int(ttl_val)
+
             self._initialized = True
-            logger.info(f"💾 [REDIS-CACHE-INIT] Zsynchronizowano: Strata={self._local_daily_loss} | Pozycje={len(self._local_positions)}")
+            logger.info(f"💾 [REDIS-CACHE-INIT] Zsynchronizowano: Strata={self._local_daily_loss} | Pozycje={len(self._local_positions)} | Cooldowny={len(self._local_cooldowns)}")
         except Exception as e:
             logger.error(f"⚠️ [REDIS-INIT-SYNC-ERROR] {e}")
 
@@ -718,6 +754,7 @@ class UpstashRedisFuturesBridge:
             return False
 
     async def is_system_paused_distributed(self) -> bool:
+        """[D7 Fix] Fail-Closed: błąd sieci lub status różny od 200 w trybie LIVE blokuje handel."""
         if not self.url:
             return GLOBAL_TRADING_PAUSED
         safe_key = self._enforce_prefix("SYSTEM_STATE:TRADING_PAUSED")
@@ -727,18 +764,22 @@ class UpstashRedisFuturesBridge:
                 if resp.status == 200:
                     res = (await resp.json()).get("result")
                     return str(res).upper() == "TRUE"
+                if not IS_SANDBOX:
+                    return True
         except Exception:
             if not IS_SANDBOX:
                 return True
         return GLOBAL_TRADING_PAUSED
 
     async def set_circuit_breaker(self, active: bool) -> bool:
+        """[D7 Fix] Ustawienie TTL Circuit Breakera precyzyjnie do godziny 00:00:00 UTC najbliższej doby."""
         if not self.url:
             return True
         safe_key = self._enforce_prefix("SYSTEM_STATE:CIRCUIT_BREAKER")
         val = "TRUE" if active else "FALSE"
+        ttl_sec = get_seconds_until_midnight_utc() if active else 86400
         try:
-            cmd = ["SET", safe_key, val, "EX", "86400"]
+            cmd = ["SET", safe_key, val, "EX", str(ttl_sec)]
             async with self.session.post(f"{self.url}", json=cmd, headers=self.headers, timeout=4) as resp:
                 return resp.status == 200
         except Exception as e:
@@ -746,6 +787,7 @@ class UpstashRedisFuturesBridge:
             return False
 
     async def is_circuit_breaker_active(self) -> bool:
+        """[D7 Fix] Fail-Closed: przy awarii połączenia z Redis zwraca True w trybie LIVE."""
         if not self.url:
             return False
         safe_key = self._enforce_prefix("SYSTEM_STATE:CIRCUIT_BREAKER")
@@ -755,8 +797,11 @@ class UpstashRedisFuturesBridge:
                 if resp.status == 200:
                     res = (await resp.json()).get("result")
                     return str(res).upper() == "TRUE"
+                if not IS_SANDBOX:
+                    return True
         except Exception:
-            pass
+            if not IS_SANDBOX:
+                return True
         return False
 
     async def get_daily_start_equity(self, day_str: str) -> Optional[float]:
@@ -926,6 +971,7 @@ class OKXSmartMoneyOracle:
         return None
 
     async def get_taker_volume_flow(self, base_ccy: str) -> Dict[str, Any]:
+        """[D1 Fix - KRYTYCZNY] Prawidłowy schemat OKX API v5: [ts, sellVol, buyVol]."""
         now = time.monotonic()
         cache_key = f"TAKER_{base_ccy}"
         if cache_key in self._cache and (now - self._cache[cache_key]["ts"] < self.ttl):
@@ -938,12 +984,13 @@ class OKXSmartMoneyOracle:
         if raw_data and isinstance(raw_data, list) and len(raw_data) > 0:
             latest = raw_data[0]
             try:
+                # W dokumentacji OKX: latest[1] to sellVol, latest[2] to buyVol
                 if isinstance(latest, list) and len(latest) >= 3:
-                    buy_v = float(latest[1])
-                    sell_v = float(latest[2])
+                    sell_v = float(latest[1])
+                    buy_v = float(latest[2])
                 elif isinstance(latest, dict):
-                    buy_v = float(latest.get("buyVol", 0.0))
                     sell_v = float(latest.get("sellVol", 0.0))
+                    buy_v = float(latest.get("buyVol", 0.0))
                 else:
                     buy_v, sell_v = 0.0, 0.0
 
@@ -1723,7 +1770,9 @@ class OKXFuturesClient:
         if matched and matched.get("algoId"):
             return "PROTECTED", matched.get("algoId")
 
-        logger.warning(f"⚠️ [ATTACHED-NOT-FOUND] {symbol}: Brak attached OCO potwierdzony. Składanie Standalone OCO...")
+        # [D18 Fix] Unikalne ID dla Standalone OCO z prefiksem S w celu wykluczenia kolizji
+        standalone_cl_id = generate_cl_ord_id("S", symbol.split('-')[0])
+        logger.warning(f"⚠️ [ATTACHED-NOT-FOUND] {symbol}: Brak attached OCO potwierdzony. Składanie Standalone OCO ({standalone_cl_id})...")
         standalone_res = await self.execute_futures_oco(
             symbol=symbol,
             pos_side=pos_side,
@@ -1731,7 +1780,7 @@ class OKXFuturesClient:
             price_tp=price_tp,
             price_sl=price_sl,
             tick_sz=tick_sz,
-            algo_cl_ord_id=attach_algo_cl_ord_id
+            algo_cl_ord_id=standalone_cl_id
         )
         ok, msg, item = validate_okx_response(standalone_res, expected_id_field="algoId")
         if ok and item:
@@ -1748,6 +1797,11 @@ async def reconcile_and_timestop_futures(
     pos_key = get_canonical_pos_key(redis_trade.prefix, inst["symbol"], pos_side)
     pos_data = await redis_trade.get_position_state(pos_key)
     if not pos_data:
+        return False, None
+
+    # [D8 Fix] Reconcile nie może przetwarzać pozycji w trakcie składania zlecenia wejścia
+    pos_state = pos_data.get("state", "PROTECTED")
+    if pos_state in ["ENTRY_SUBMITTED", "ENTRY_UNKNOWN"]:
         return False, None
 
     actual_pos_on_exchange = await inst["client"].get_open_position_size(inst["symbol"], pos_side)
@@ -1790,10 +1844,15 @@ async def reconcile_and_timestop_futures(
             roe_net = round(real_pos_history["pnl_ratio"], 2)
         else:
             exit_p = actual_px if actual_px and actual_px > 0 else (sl_p if pos_side == "long" else tp_p)
-            spec = inst["client"].instruments_cache.get(inst["symbol"], {"ctVal": 1.0})
-            ct_val = spec["ctVal"]
+            spec = inst["client"].instruments_cache.get(inst["symbol"], {"ctVal": 1.0, "ctValCcy": ""})
+            ct_val = float(spec.get("ctVal", 1.0))
+            ct_val_ccy = str(spec.get("ctValCcy", "")).upper()
             mult = 1.0 if pos_side == "long" else -1.0
-            pnl_gross = (exit_p - entry_p) * mult * contracts * ct_val
+            # [D14 Fix] Prawidłowa wycena PnL z uwzględnieniem jednostki kontraktu
+            if ct_val_ccy in ["USD", "USDC", "USDT"]:
+                pnl_gross = ((exit_p - entry_p) / entry_p) * mult * contracts * ct_val if entry_p > 0 else 0.0
+            else:
+                pnl_gross = (exit_p - entry_p) * mult * contracts * ct_val
             pnl_net = round(pnl_gross - (margin_locked * 0.001), 2)
             roe_net = round((pnl_net / margin_locked) * 100.0, 2) if margin_locked > 0 else 0.0
 
@@ -1859,15 +1918,21 @@ async def reconcile_and_timestop_futures(
                     await redis_trade.set_position_state(pos_key, pos_data)
                     await tg.push(f"🛡️ <b>[DYNAMIC BREAK-EVEN: {inst['label']}]</b> SL przesunięty na <code>{new_sl_px} {QUOTE_CCY}</code>")
 
+    # [D13 Fix] Prawidłowa sekwencja Time-Stop: najpierw zrzut rynkowy reduceOnly, po potwierdzeniu anulowanie algo
     if (time.time() - opened_at) > max_timeout:
-        logger.warning(f"⏳ [TIME-STOP] Pozycja {inst['label']} [{pos_side}] przekroczyła {round(max_timeout/3600, 1)}h. Likwidacja...")
-        if algo_id != "EXT_MANUAL":
-            await inst["client"].cancel_algo_order(inst["symbol"], algo_id)
-        await asyncio.sleep(0.3)
-        await inst["client"].emergency_flatten_position(inst["symbol"], pos_side)
-        pos_data["state"] = "FLAT_PENDING_SETTLEMENT"
-        await redis_trade.set_position_state(pos_key, pos_data)
-        return True, pos_key
+        logger.warning(f"⏳ [TIME-STOP] Pozycja {inst['label']} [{pos_side}] przekroczyła {round(max_timeout/3600, 1)}h. Zamykanie...")
+        flatten_ok = await inst["client"].emergency_flatten_position(inst["symbol"], pos_side)
+        if flatten_ok:
+            if algo_id not in ["EXT_MANUAL", "NONE"]:
+                await inst["client"].cancel_algo_order(inst["symbol"], algo_id)
+            pos_data["state"] = "FLAT_PENDING_SETTLEMENT"
+            await redis_trade.set_position_state(pos_key, pos_data)
+            return True, pos_key
+        else:
+            logger.critical(f"🔥 [TIME-STOP-FLATTEN-FAILED] Nie udało się zamknąć {inst['label']}. Rezerwacja SOS_LOCKED.")
+            pos_data["state"] = "SOS_LOCKED"
+            await redis_trade.set_position_state(pos_key, pos_data)
+            return False, None
 
     return False, None
 
@@ -1908,9 +1973,10 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                 await interruptible_sleep(60)
                 continue
 
-            best_signal = None
+            # [D2 Fix] Zbieramy wszystkich kandydatów i sortujemy po wskaźniku dominacji
+            candidates: List[Dict[str, Any]] = []
             scan_counter += 1
-            is_verbose_cycle = (scan_counter % 10 == 0) # Loguj szczegóły co ~7.5 minuty
+            is_verbose_cycle = (scan_counter % 10 == 0)
 
             if is_verbose_cycle:
                 logger.info(f"🔍 [4-TF-SCAN] Skanowanie koszyka (Sloty: {len(active_keys)}/{CONFIG['ALPHA_MAX_ACTIVE_SLOTS']})...")
@@ -2002,15 +2068,21 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                 if sig_long or sig_short:
                     tactical = "TREND_PULLBACK" if dist_to_ema_15m <= 0.0018 else "4TF_SNIPER_CORE"
                     logger.info(f"🎯 [POTENTIAL-SIGNAL] {conf['label']} spełnił 4 ekrany! (Strona: {'LONG' if sig_long else 'SHORT'}, Dominacja: {round(dominance*100, 1)}%)")
-                    if best_signal is None or dominance > best_signal["dominance"]:
-                        best_signal = {
-                            "symbol": sym, "base": base, "conf": conf,
-                            "side": "long" if sig_long else "short",
-                            "dominance": dominance, "c5m_full": c5m[:-1],
-                            "strategy": tactical
-                        }
+                    candidates.append({
+                        "symbol": sym, "base": base, "conf": conf,
+                        "side": "long" if sig_long else "short",
+                        "dominance": dominance, "c5m_full": c5m[:-1],
+                        "strategy": tactical
+                    })
 
-            if best_signal and IS_MASTER_ENGINE_NODE:
+            # [D2 Fix] Sortowanie kandydatów po dominacji korpusu (od najlepszego)
+            candidates.sort(key=lambda x: x["dominance"], reverse=True)
+
+            # Iterujemy po kandydatach – jeśli lider nie przejdzie sizingu, sprawdzamy kolejnych!
+            for best_signal in candidates:
+                if not IS_MASTER_ENGINE_NODE:
+                    break
+
                 sym = best_signal["symbol"]
                 base = best_signal["base"]
                 conf = best_signal["conf"]
@@ -2020,7 +2092,6 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                 sm_ok, sm_note, _ = await smart_money_oracle.check_smart_money_alignment(base, pos_side)
                 if not sm_ok:
                     logger.warning(f"🐳 [SMART-MONEY] Odrzucono sygnał {conf['label']}: {sm_note}")
-                    await interruptible_sleep(20)
                     continue
 
                 async with GLOBAL_ALPHA_LOCK:
@@ -2127,6 +2198,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                     real_fill_px = pos_details["avgPx"] if pos_details["avgPx"] > 0 else entry_live_price
                     actual_pos_margin = pos_details["margin"] if pos_details["margin"] > 0 else actual_margin
 
+                    # [D6 Fix] Aktualizacja zleceń na giełdzie po poślizgu cenowym
                     slippage = abs(real_fill_px - entry_live_price) / entry_live_price
                     if slippage > CONFIG["MAX_ENTRY_SLIPPAGE_PCT"]:
                         ct_val = spec.get("ctVal", 1.0)
@@ -2134,10 +2206,18 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         monetary_risk = real_size * raw_dist * ct_val
                         max_allowed_risk = available_cash * CONFIG["HARD_RISK_CAP_ON_SLIPPAGE_PCT"]
 
+                        # [D3 Fix] Obsługa błędu awaryjnego zrzutu – brak bezmyślnego kasowania klucza
                         if monetary_risk > max_allowed_risk:
                             logger.critical(f"🔥 [SLIPPAGE-ABORT] {sym}: Ryzyko ({monetary_risk:.2f}) > limit ({max_allowed_risk:.2f}). Natychmiastowy zrzut!")
-                            await okx_client.emergency_flatten_position(sym, pos_side)
-                            await redis_trade.delete_key(canonical_pos_key)
+                            flatten_ok = await okx_client.emergency_flatten_position(sym, pos_side)
+                            if flatten_ok:
+                                await redis_trade.delete_key(canonical_pos_key)
+                            else:
+                                logger.critical(f"🔥 [FLATTEN-FAILED] {sym}: Pozycja nadal na giełdzie! Zapis SOS_LOCKED.")
+                                await redis_trade.set_position_state(canonical_pos_key, {
+                                    "version": 1, "state": "SOS_LOCKED", "instId": sym, "posSide": pos_side, "updatedAt": time.time()
+                                })
+                                await redis_trade.set_system_pause(True)
                             await redis_trade.clear_cooldown("PORTFOLIO_STAGGER_LOCK")
                             continue
                         else:
@@ -2156,12 +2236,24 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         attach_algo_cl_ord_id=my_algo_cl_id
                     )
 
+                    # [D3 Fix] Brak cichego kasowania stanu w razie odrzucenia ochrony
                     if prot_state != "PROTECTED" or not real_algo_id:
                         logger.critical(f"🔥 [UNPROTECTED-ABORT] {sym}: Ochrona OCO niepotwierdzona. Awaryjny zrzut pozycji.")
-                        await okx_client.emergency_flatten_position(sym, pos_side)
-                        await redis_trade.delete_key(canonical_pos_key)
+                        flatten_ok = await okx_client.emergency_flatten_position(sym, pos_side)
+                        if flatten_ok:
+                            await redis_trade.delete_key(canonical_pos_key)
+                        else:
+                            logger.critical(f"🔥 [FLATTEN-FAILED] {sym}: Pozycja bez ochrony nadal otwarta! Zapis SOS_LOCKED.")
+                            await redis_trade.set_position_state(canonical_pos_key, {
+                                "version": 1, "state": "SOS_LOCKED", "instId": sym, "posSide": pos_side, "updatedAt": time.time()
+                            })
+                            await redis_trade.set_system_pause(True)
                         await redis_trade.clear_cooldown("PORTFOLIO_STAGGER_LOCK")
                         continue
+
+                    # [D6 Fix] Jeśli nastąpił poślizg, modyfikujemy aktywne OCO na giełdzie pod nowe ceny
+                    if slippage > CONFIG["MAX_ENTRY_SLIPPAGE_PCT"]:
+                        await okx_client.amend_algo_order(sym, real_algo_id, new_sl_trigger_px=format_px(price_sl, tick_sz))
 
                     canonical_record = {
                         "version": 1,
@@ -2197,10 +2289,12 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         f"🛡️ <b>Stan: PROTECTED (OKX OCO Algo ID: {real_algo_id})</b>\n"
                         f"🐳 Smart Money: <code>{sm_note}</code>"
                     )
+                    break # Pomyślnie zrealizowano najlepszy sygnał
         except Exception as e:
             logger.error(f"❌ [4-TF SNIPER ERROR] {e}")
-
-        await interruptible_sleep(45)
+        finally:
+            # [D2 Fix] Gwarantowany sen taktujący – zero busy-waiting
+            await interruptible_sleep(45)
 
 async def master_lock_heartbeat_worker(redis_trade):
     global IS_MASTER_ENGINE_NODE
@@ -2250,9 +2344,15 @@ async def master_bootstrap(redis_trade, okx_client, session):
         async with session.get(f"{okx_client.base_url}{req_pos_path}", headers=headers_p, timeout=6) as r_p:
             p_data = await r_p.json()
             if p_data.get("code") == "0" and p_data.get("data"):
+                # [D5 Fix] Adoptujemy wyłącznie pozycje ze zdefiniowanych symboli
+                configured_symbols = {item["symbol"] for item in FUTURES_INSTRUMENTS}
                 for pos_item in p_data["data"]:
                     pos_sz = abs(float(pos_item.get("pos", 0.0) or 0.0))
                     pos_inst = pos_item.get("instId")
+                    if pos_inst not in configured_symbols:
+                        logger.warning(f"⚠️ [REHYDRATION-SKIP] Pomijanie obcego instrumentu: {pos_inst}")
+                        continue
+
                     raw_side = pos_item.get("posSide", "long").lower()
                     raw_pos_float = float(pos_item.get("pos", 0.0) or 0.0)
                     pos_side = "long" if (raw_side == "long" or (raw_side == "net" and raw_pos_float > 0)) else "short"
@@ -2268,13 +2368,15 @@ async def master_bootstrap(redis_trade, okx_client, session):
                             spec = okx_client.instruments_cache.get(pos_inst, {"tickSz": 0.1})
                             tick_sz = spec["tickSz"]
 
+                            # [D5 Fix] Filtrowanie OCO ze ścisłym dopasowaniem strony pozycji posSide
+                            matching_algos = [a for a in pending_algos if a.get("posSide", "").lower() == pos_side.lower()] if pending_algos else []
                             detected_algo_id = None
                             detected_tp, detected_sl = avg_px * 1.02, avg_px * 0.98
 
-                            if pending_algos:
-                                detected_algo_id = pending_algos[0].get("algoId")
-                                detected_tp = float(pending_algos[0].get("tpTriggerPx", avg_px * 1.02))
-                                detected_sl = float(pending_algos[0].get("slTriggerPx", avg_px * 0.98))
+                            if matching_algos:
+                                detected_algo_id = matching_algos[0].get("algoId")
+                                detected_tp = float(matching_algos[0].get("tpTriggerPx", avg_px * 1.02))
+                                detected_sl = float(matching_algos[0].get("slTriggerPx", avg_px * 0.98))
                             else:
                                 logger.critical(f"🚨 [NAKED-REHYDRATION] Pozycja {pos_inst}:{pos_side} bez OCO! Uzbrajanie...")
                                 p_sl, p_tp, _ = calculate_clamped_sl_tp(avg_px, 0.0, 0.0, 1.5, tick_sz, pos_side)
