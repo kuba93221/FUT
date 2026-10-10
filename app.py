@@ -30,7 +30,7 @@ except Exception:
     pass
 
 class FlushStreamHandler(logging.StreamHandler):
-    """Gwarantuje natychmiastowe wypychanie logow do konsoli Rendera bez buforowania."""
+    """Gwarantuje natychmiastowe wypychanie logów do konsoli Rendera bez buforowania."""
     def emit(self, record):
         super().emit(record)
         self.flush()
@@ -52,7 +52,6 @@ QUOTE_CCY = os.environ.get("QUOTE_CCY", DEFAULT_CCY).strip().upper()
 TARGET_LEVERAGE = 3
 TARGET_MARGIN_MODE = "isolated"
 
-# [B1 & B2 Fix] Wymuszenie bezpiecznego sekretu z env (min. 16 znakow)
 EMERGENCY_SECRET = os.environ.get("EMERGENCY_SECRET", "").strip()
 if not EMERGENCY_SECRET or len(EMERGENCY_SECRET) < 16:
     if not IS_SANDBOX:
@@ -71,7 +70,7 @@ def get_seconds_until_midnight_utc() -> int:
     return max(60, diff)
 
 class TokenBucketRateLimiter:
-    """[Concurrency & Rate Limiting] Deterministyczny Token Bucket z rezerwacją tokenów."""
+    """Deterministyczny Token Bucket z atomową rezerwacją tokenów."""
     def __init__(self, tokens_per_second: float = 4.0, max_capacity: float = 8.0):
         self.rate = tokens_per_second
         self.capacity = max_capacity
@@ -99,7 +98,7 @@ class TokenBucketRateLimiter:
         if wait_time > 0.0:
             await asyncio.sleep(wait_time)
 
-logger.info(f"⚙️ [SYSTEM-INIT] Silnik Futures 3x v17.9-MULTI-ASSET Online [QUOTE: {QUOTE_CCY} | PREFIKS: {REDIS_PREFIX} | SANDBOX: {IS_SANDBOX}]")
+logger.info(f"⚙️ [SYSTEM-INIT] Silnik Futures 3x v18.0 PROD (M15 CHoCH Baseline) Online [QUOTE: {QUOTE_CCY} | PREFIKS: {REDIS_PREFIX} | SANDBOX: {IS_SANDBOX}]")
 
 BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
 GLOBAL_ALPHA_LOCK: Optional[asyncio.Lock] = None
@@ -123,70 +122,42 @@ SHUTDOWN_COMPLETE = threading.Event()
 PROCESS_DRAINING = threading.Event()
 GLOBAL_TRADING_PAUSED = False
 
-# [MULTI-ASSET EXPANSION v17.9: 9 INSTRUMENTÓW W KOSZYKU]
 FUTURES_INSTRUMENTS = [
     {
         "symbol": "BTC-USD_UM_XPERP-310404" if not IS_SANDBOX else "BTC-USD_UM_XPERP-310328",
         "family": "BTC-USD_UM_XPERP",
         "base": "BTC",
         "label": "BTC_USD_XPERP",
-        "price_round": 2
+        "price_round": 2,
+        "is_usd_ct": True,
+        "ct_val": 10.0
     },
     {
         "symbol": "ETH-USD_UM_XPERP-310404" if not IS_SANDBOX else "ETH-USD_UM_XPERP-310328",
         "family": "ETH-USD_UM_XPERP",
         "base": "ETH",
         "label": "ETH_USD_XPERP",
-        "price_round": 2
+        "price_round": 2,
+        "is_usd_ct": False,
+        "ct_val": 1.0
     },
     {
         "symbol": "SOL-USD_UM_XPERP-310404" if not IS_SANDBOX else "SOL-USD_UM-260925",
         "family": "SOL-USD_UM_XPERP",
         "base": "SOL",
         "label": "SOL_USD_FUT",
-        "price_round": 2
+        "price_round": 2,
+        "is_usd_ct": False,
+        "ct_val": 1.0
     },
     {
         "symbol": "XRP-USD_UM_XPERP-310404" if not IS_SANDBOX else "XRP-USD_UM_XPERP-310801",
         "family": "XRP-USD_UM_XPERP",
         "base": "XRP",
         "label": "XRP_USD_XPERP",
-        "price_round": 4
-    },
-    {
-        "symbol": "DOGE-USD_UM_XPERP-310404" if not IS_SANDBOX else "DOGE-USD_UM_XPERP-310404",
-        "family": "DOGE-USD_UM_XPERP",
-        "base": "DOGE",
-        "label": "DOGE_USD_XPERP",
-        "price_round": 5
-    },
-    {
-        "symbol": "LINK-USD_UM_XPERP-310404" if not IS_SANDBOX else "LINK-USD_UM_XPERP-310404",
-        "family": "LINK-USD_UM_XPERP",
-        "base": "LINK",
-        "label": "LINK_USD_XPERP",
-        "price_round": 3
-    },
-    {
-        "symbol": "AVAX-USD_UM_XPERP-310404" if not IS_SANDBOX else "AVAX-USD_UM_XPERP-310404",
-        "family": "AVAX-USD_UM_XPERP",
-        "base": "AVAX",
-        "label": "AVAX_USD_XPERP",
-        "price_round": 2
-    },
-    {
-        "symbol": "SUI-USD_UM_XPERP-310404" if not IS_SANDBOX else "SUI-USD_UM_XPERP-310404",
-        "family": "SUI-USD_UM_XPERP",
-        "base": "SUI",
-        "label": "SUI_USD_XPERP",
-        "price_round": 4
-    },
-    {
-        "symbol": "BNB-USD_UM_XPERP-310523" if not IS_SANDBOX else "BNB-USD_UM_XPERP-310523",
-        "family": "BNB-USD_UM_XPERP",
-        "base": "BNB",
-        "label": "BNB_USD_XPERP",
-        "price_round": 2
+        "price_round": 4,
+        "is_usd_ct": False,
+        "ct_val": 1.0
     }
 ]
 
@@ -199,20 +170,19 @@ CONFIG = {
     "MAX_ENTRY_SLIPPAGE_PCT": 0.0030,
     "HARD_RISK_CAP_ON_SLIPPAGE_PCT": 0.0050,
     "DYNAMIC_RISK": {
-        "MIN_SL_PCT": 0.006,
-        "MAX_SL_HARD_CAP": 0.015,
-        "DEFAULT_SL_PCT": 0.010,
+        "MIN_SL_PCT": 0.012,
+        "MAX_SL_HARD_CAP": 0.035,
+        "DEFAULT_SL_PCT": 0.018,
         "VOLATILITY_CUSHION_PCT": 0.0015,
-        "BREAK_EVEN_TRIGGER_RATIO": 0.75,
-        "BREAK_EVEN_FEE_BUFFER_PCT": 0.0010
+        "BREAK_EVEN_TRIGGER_RATIO": 0.80,
+        "BREAK_EVEN_FEE_BUFFER_PCT": 0.0010,
+        "RR_RATIO": 1.8
     },
     "TIMEOUTS": {
-        "DIGITAL_TWIN_SNIPER": 8 * 3600,
-        "REHYDRATED_RECOVERY": 8 * 3600,
-        "TREND_PULLBACK": 6 * 3600,
-        "VOLATILITY_BREAKOUT": 3 * 3600,
-        "MEAN_REVERSION": 8 * 3600,
-        "4TF_SNIPER_CORE": 8 * 3600
+        "M15_CHOCH": 48 * 3600,
+        "4TF_SNIPER_CORE": 48 * 3600,
+        "TREND_PULLBACK": 48 * 3600,
+        "REHYDRATED_RECOVERY": 48 * 3600
     },
     "SAFETY_GUARDS": {
         "PORTFOLIO_STAGGER_LOCK_SECONDS": 30 * 60,
@@ -222,6 +192,7 @@ CONFIG = {
         "DAILY_CIRCUIT_BREAKER_PCT": 0.03,
         "SMART_MONEY": {
             "ENABLED": True,
+            "BYPASS_PULLBACK": True,
             "MAX_TAKER_IMBALANCE_RATIO": 1.35,
             "CACHE_TTL_SECONDS": 180
         }
@@ -319,49 +290,149 @@ def calc_atr(candles: List[List[str]], period: int = 14) -> float:
         return 0.0
     return sum(tr_list[-period:]) / period
 
-def calculate_clamped_sl_tp(
-    current_price: float,
-    atr: float,
-    atr_mult: float,
-    rr_ratio: float,
+def find_m15_recent_swing_high(candles_15m: List[List[str]], lookback: int = 16) -> Optional[float]:
+    if len(candles_15m) < 5:
+        return None
+    highs = [float(c[2]) for c in candles_15m]
+    n = len(highs)
+    start_idx = n - 3
+    end_idx = max(2, n - 1 - lookback)
+    for i in range(start_idx, end_idx - 1, -1):
+        c_h = highs[i]
+        if (highs[i - 1] <= c_h and highs[i - 2] <= c_h and
+            highs[i + 1] <= c_h and highs[i + 2] <= c_h):
+            return c_h
+    return None
+
+def find_m15_recent_swing_low(candles_15m: List[List[str]], lookback: int = 16) -> Optional[float]:
+    if len(candles_15m) < 5:
+        return None
+    lows = [float(c[3]) for c in candles_15m]
+    n = len(lows)
+    start_idx = n - 3
+    end_idx = max(2, n - 1 - lookback)
+    for i in range(start_idx, end_idx - 1, -1):
+        c_l = lows[i]
+        if (lows[i - 1] >= c_l and lows[i - 2] >= c_l and
+            lows[i + 1] >= c_l and lows[i + 2] >= c_l):
+            return c_l
+    return None
+
+def find_structural_h1_swing_sl(
+    candles_1h: List[List[str]],
+    entry_price: float,
+    pos_side: str,
     tick_sz: float,
-    pos_side: str = "long"
+    lookback_bars: int = 40,
+    pivot_radius: int = 2,
+    cushion_pct: float = 0.0015,
+    min_sl_pct: float = 0.012,
+    max_sl_pct: float = 0.035,
+    rr_ratio: float = 1.8
 ) -> Tuple[float, float, float]:
-    min_sl = CONFIG["DYNAMIC_RISK"]["MIN_SL_PCT"]
-    max_sl = CONFIG["DYNAMIC_RISK"]["MAX_SL_HARD_CAP"]
-    def_sl = CONFIG["DYNAMIC_RISK"]["DEFAULT_SL_PCT"]
-    cushion_pct = CONFIG["DYNAMIC_RISK"].get("VOLATILITY_CUSHION_PCT", 0.0015)
+    lows = [float(c[3]) for c in candles_1h]
+    highs = [float(c[2]) for c in candles_1h]
+    curr_h1_idx = len(lows) - 1
 
-    if atr > 0 and current_price > 0:
-        base_sl_pct = (atr * atr_mult) / current_price
-    else:
-        base_sl_pct = def_sl
+    if curr_h1_idx < 3 or entry_price <= 0:
+        def_sl = 0.018
+        p_sl = entry_price * (1.0 - def_sl) if pos_side == "long" else entry_price * (1.0 + def_sl)
+        p_tp = entry_price * (1.0 + def_sl * rr_ratio) if pos_side == "long" else entry_price * (1.0 - def_sl * rr_ratio)
+        return round_price_to_tick(p_sl, tick_sz, "DOWN"), round_price_to_tick(p_tp, tick_sz, "UP"), def_sl
 
-    raw_sl_pct = base_sl_pct + cushion_pct
-    sl_pct = max(min_sl, min(raw_sl_pct, max_sl))
-    tp_pct = sl_pct * rr_ratio
+    found_level: Optional[float] = None
+    start_idx = curr_h1_idx - 1
+    end_idx = max(1, curr_h1_idx - lookback_bars)
 
     if pos_side == "long":
-        raw_sl = current_price * (1.0 - sl_pct)
-        raw_tp = current_price * (1.0 + tp_pct)
-        price_sl = round_price_to_tick(raw_sl, tick_sz, direction="DOWN")
-        price_tp = round_price_to_tick(raw_tp, tick_sz, direction="UP")
-    else:
-        raw_sl = current_price * (1.0 + sl_pct)
-        raw_tp = current_price * (1.0 - tp_pct)
-        price_sl = round_price_to_tick(raw_sl, tick_sz, direction="UP")
-        price_tp = round_price_to_tick(raw_tp, tick_sz, direction="DOWN")
+        for i in range(start_idx, end_idx - 1, -1):
+            eff_radius = 1 if i == (curr_h1_idx - 1) else pivot_radius
+            if (i - eff_radius) < 0 or (i + eff_radius) > curr_h1_idx:
+                continue
 
-    eff_sl_pct = abs(current_price - price_sl) / current_price if current_price > 0 else sl_pct
-    eff_sl_pct = max(min_sl, min(eff_sl_pct, max_sl))
+            is_pivot = True
+            c_low = lows[i]
+            for offset in range(1, eff_radius + 1):
+                if lows[i - offset] <= c_low or lows[i + offset] <= c_low:
+                    is_pivot = False
+                    break
+            if is_pivot and c_low < entry_price:
+                found_level = c_low
+                break
+
+        if found_level is None:
+            valid_lows = [l for l in lows[max(0, curr_h1_idx - 14) : curr_h1_idx + 1] if l < entry_price]
+            found_level = min(valid_lows) if valid_lows else entry_price * (1.0 - min_sl_pct)
+
+        raw_sl_price = found_level * (1.0 - cushion_pct)
+        clamped_sl_pct = max(min_sl_pct, min((entry_price - raw_sl_price) / entry_price, max_sl_pct))
+
+        price_sl = round_price_to_tick(entry_price * (1.0 - clamped_sl_pct), tick_sz, "DOWN")
+        eff_sl_pct = max(min_sl_pct, abs(entry_price - price_sl) / entry_price if entry_price > 0 else min_sl_pct)
+        price_tp = round_price_to_tick(entry_price * (1.0 + eff_sl_pct * rr_ratio), tick_sz, "UP")
+
+    else:
+        for i in range(start_idx, end_idx - 1, -1):
+            eff_radius = 1 if i == (curr_h1_idx - 1) else pivot_radius
+            if (i - eff_radius) < 0 or (i + eff_radius) > curr_h1_idx:
+                continue
+
+            is_pivot = True
+            c_high = highs[i]
+            for offset in range(1, eff_radius + 1):
+                if highs[i - offset] >= c_high or highs[i + offset] >= c_high:
+                    is_pivot = False
+                    break
+            if is_pivot and c_high > entry_price:
+                found_level = c_high
+                break
+
+        if found_level is None:
+            valid_highs = [h for h in highs[max(0, curr_h1_idx - 14) : curr_h1_idx + 1] if h > entry_price]
+            found_level = max(valid_highs) if valid_highs else entry_price * (1.0 + min_sl_pct)
+
+        raw_sl_price = found_level * (1.0 + cushion_pct)
+        clamped_sl_pct = max(min_sl_pct, min((raw_sl_price - entry_price) / entry_price, max_sl_pct))
+
+        price_sl = round_price_to_tick(entry_price * (1.0 + clamped_sl_pct), tick_sz, "UP")
+        eff_sl_pct = max(min_sl_pct, abs(price_sl - entry_price) / entry_price if entry_price > 0 else min_sl_pct)
+        price_tp = round_price_to_tick(entry_price * (1.0 - eff_sl_pct * rr_ratio), tick_sz, "DOWN")
 
     return price_sl, price_tp, eff_sl_pct
+
+def get_strictly_closed_candles_slice(
+    candles: List[List[str]],
+    bar_sec: int,
+    now_sec: float
+) -> Tuple[List[List[str]], Optional[List[str]]]:
+    """Deterministyczny Timestamp Bucket Resolver eliminujący pułapkę pustego pierwszego ticka."""
+    if not candles:
+        return [], None
+
+    now_ms = int(now_sec * 1000)
+    bar_ms = bar_sec * 1000
+    current_bucket = (now_ms // bar_ms) * bar_ms
+    target_closed_bucket = current_bucket - bar_ms
+
+    last_candle_ts = int(candles[-1][0])
+
+    if last_candle_ts == current_bucket:
+        closed_slice = candles[:-1]
+    elif last_candle_ts == target_closed_bucket:
+        closed_slice = candles[:]
+    elif last_candle_ts < target_closed_bucket:
+        return [], None
+    else:
+        closed_slice = [c for c in candles if int(c[0]) <= target_closed_bucket]
+
+    last_closed = closed_slice[-1] if closed_slice and int(closed_slice[-1][0]) == target_closed_bucket else None
+    return closed_slice, last_closed
 
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 def require_admin() -> bool:
-    """[B1, B2, B3 Fix] Autoryzacja WYŁĄCZNIE przez nagłówek X-Admin-Secret z kodowaniem bajtów."""
+    """Autoryzacja WYŁĄCZNIE przez nagłówek X-Admin-Secret z bezpiecznym porównaniem bajtów."""
     if not EMERGENCY_SECRET:
         return False
     supplied = request.headers.get("X-Admin-Secret", "").strip()
@@ -374,7 +445,7 @@ def health_check():
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running() or PROCESS_DRAINING.is_set():
         return "FUTURES_ENGINE_DRAINING", 503
     role = "MASTER" if IS_MASTER_ENGINE_NODE else "PASSIVE"
-    return f"FUTURES_ENGINE_ONLINE_3X_{QUOTE_CCY} [{role}]", 200
+    return f"FUTURES_ENGINE_ONLINE_v18_CHOCH_{QUOTE_CCY} [{role}]", 200
 
 @app.route('/status', methods=['GET'])
 def engine_status_endpoint():
@@ -392,7 +463,7 @@ def engine_status_endpoint():
         today_str = datetime.now(UTC).strftime('%Y%m%d')
         start_equity = await GLOBAL_REDIS_BRIDGE.get_daily_start_equity(today_str)
         if start_equity is None or start_equity <= 0:
-            start_equity = wallet.get("total_equity", 360.0) if wallet else 360.0
+            start_equity = wallet.get("total_equity", 332.63) if wallet else 332.63
 
         positions_details = []
         for k in active_keys:
@@ -408,7 +479,7 @@ def engine_status_endpoint():
 
         return {
             "status": "ONLINE",
-            "version": "v17.9_MULTI_ASSET",
+            "version": "v18.0_M15_CHOCH_PROD",
             "engine_role": "MASTER" if IS_MASTER_ENGINE_NODE else "PASSIVE",
             "quote_currency": QUOTE_CCY,
             "target_leverage": TARGET_LEVERAGE,
@@ -437,7 +508,7 @@ def engine_status_endpoint():
 
 @app.route('/claim-master', methods=['POST', 'GET'])
 def claim_master_endpoint():
-    """Wymusza natychmiastowe przejecie roli Master bez czekania na TTL w Redis."""
+    """Wymusza natychmiastowe przejęcie roli Master bez czekania na TTL w Redis."""
     if not require_admin():
         return jsonify({"error": "Unauthorized"}), 403
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running() or not GLOBAL_REDIS_BRIDGE:
@@ -453,6 +524,7 @@ def claim_master_endpoint():
             IS_MASTER_ENGINE_NODE = True
             await master_bootstrap(GLOBAL_REDIS_BRIDGE, GLOBAL_OKX_CLIENT, GLOBAL_OKX_CLIENT.session)
             spawn_supervised_task(master_lock_heartbeat_worker, "master_heartbeat_worker", GLOBAL_REDIS_BRIDGE, tg=GLOBAL_TG)
+            spawn_supervised_task(protection_reconciler_worker, "reconciler_worker", GLOBAL_REDIS_BRIDGE, GLOBAL_TG, GLOBAL_OKX_CLIENT)
             spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", GLOBAL_OKX_CLIENT.session, GLOBAL_REDIS_BRIDGE, GLOBAL_TG, GLOBAL_OKX_CLIENT, GLOBAL_SMART_MONEY_ORACLE, tg=GLOBAL_TG)
             logger.info("👑 [FORCE-CLAIM-MASTER] Ręcznie wymuszono rolę MASTER Engine przez administratora!")
         return {"status": "success", "engine_role": "MASTER", "worker_id": ENGINE_WORKER_ID}
@@ -566,7 +638,6 @@ def emergency_liquidate_endpoint():
 
             report = {"closed_positions": [], "canceled_pending": [], "canceled_algos": [], "freed_slots": 0, "verified_flat": False}
             
-            # KROK 1: Anulowanie zwyklych zlecen oczekujacych
             for item in FUTURES_INSTRUMENTS:
                 sym = item["symbol"]
                 try:
@@ -587,7 +658,6 @@ def emergency_liquidate_endpoint():
                 except Exception as e:
                     logger.error(f"[EMERGENCY-CANCEL-PENDING] {sym}: {e}")
 
-            # KROK 2 [D12 Fix]: NATYCHMIASTOWY ZRZUT POZYCJI PRZED ANULOWANIEM OCO
             for item in FUTURES_INSTRUMENTS:
                 sym = item["symbol"]
                 for side in ["long", "short"]:
@@ -595,7 +665,6 @@ def emergency_liquidate_endpoint():
                     if flattened:
                         report["closed_positions"].append(f"{sym}:{side}")
 
-            # KROK 3 [D12 Fix]: Dopiero po zrzucie pozycji anulujemy zlecenia OCO
             for item in FUTURES_INSTRUMENTS:
                 sym = item["symbol"]
                 try:
@@ -707,7 +776,6 @@ class UpstashRedisFuturesBridge:
                                     if pos_obj:
                                         self._local_positions[clean_k] = pos_obj
 
-            # [D9 Fix] Odzyskiwanie kwarantann i cooldownów z bazy Redis po restarcie
             pattern_cd = f"{self.prefix}COOLDOWN:*"
             async with self.session.get(f"{self.url}/keys/{pattern_cd}", headers=self.headers, timeout=4) as r_cd:
                 if r_cd.status == 200:
@@ -788,7 +856,6 @@ class UpstashRedisFuturesBridge:
             return False
 
     async def is_system_paused_distributed(self) -> bool:
-        """[D7 Fix] Fail-Closed: błąd sieci w trybie LIVE blokuje handel."""
         if not self.url:
             return GLOBAL_TRADING_PAUSED
         safe_key = self._enforce_prefix("SYSTEM_STATE:TRADING_PAUSED")
@@ -806,7 +873,6 @@ class UpstashRedisFuturesBridge:
         return GLOBAL_TRADING_PAUSED
 
     async def set_circuit_breaker(self, active: bool) -> bool:
-        """[D7 Fix] Ustawienie TTL Circuit Breakera do godziny 00:00:00 UTC."""
         if not self.url:
             return True
         safe_key = self._enforce_prefix("SYSTEM_STATE:CIRCUIT_BREAKER")
@@ -821,7 +887,6 @@ class UpstashRedisFuturesBridge:
             return False
 
     async def is_circuit_breaker_active(self) -> bool:
-        """[D7 Fix] Fail-Closed: przy awarii połączenia zwraca True w trybie LIVE."""
         if not self.url:
             return False
         safe_key = self._enforce_prefix("SYSTEM_STATE:CIRCUIT_BREAKER")
@@ -1005,7 +1070,7 @@ class OKXSmartMoneyOracle:
         return None
 
     async def get_taker_volume_flow(self, base_ccy: str) -> Dict[str, Any]:
-        """[D1 Fix - KRYTYCZNY] Prawidłowy schemat OKX API v5: [ts, sellVol, buyVol]."""
+        """Prawidłowy schemat OKX API v5: [ts, sellVol, buyVol]."""
         now = time.monotonic()
         cache_key = f"TAKER_{base_ccy}"
         if cache_key in self._cache and (now - self._cache[cache_key]["ts"] < self.ttl):
@@ -1018,7 +1083,6 @@ class OKXSmartMoneyOracle:
         if raw_data and isinstance(raw_data, list) and len(raw_data) > 0:
             latest = raw_data[0]
             try:
-                # W dokumentacji OKX: latest[1] to sellVol, latest[2] to buyVol
                 if isinstance(latest, list) and len(latest) >= 3:
                     sell_v = float(latest[1])
                     buy_v = float(latest[2])
@@ -1172,6 +1236,7 @@ class OKXFuturesClient:
         self.passphrase = os.environ.get("OKX_PASSPHRASE", "").strip()
 
         self.instruments_cache: Dict[str, Dict[str, Any]] = {}
+        self._candles_cache: Dict[str, Dict[str, Any]] = {}
         self.TARGET_LEVERAGE = TARGET_LEVERAGE
         self.MARGIN_MODE = TARGET_MARGIN_MODE
 
@@ -1258,7 +1323,7 @@ class OKXFuturesClient:
                             "settleCcy": item.get("settleCcy", QUOTE_CCY)
                         }
                         self.instruments_cache[symbol] = spec
-                        logger.info(f"📋 [SPEC-LOADED] {symbol} | tickSz: {spec['tickSz']} | lotSz: {spec['lotSz']}")
+                        logger.info(f"📋 [SPEC-LOADED] {symbol} | tickSz: {spec['tickSz']} | lotSz: {spec['lotSz']} | ctVal: {spec['ctVal']} {spec['ctValCcy']}")
                         return spec
             except Exception as e:
                 logger.error(f"[FUTURES-SPEC] {symbol}: {e}")
@@ -1318,7 +1383,8 @@ class OKXFuturesClient:
         symbol: str,
         current_price: float,
         target_margin_quote: float,
-        max_allowed_margin: float
+        max_allowed_margin: float,
+        is_usd_ct: bool = False
     ) -> Tuple[float, float]:
         spec = self.instruments_cache.get(symbol)
         if not spec or current_price <= 0:
@@ -1330,12 +1396,12 @@ class OKXFuturesClient:
         lot_sz = float(spec.get("lotSz", 0.01))
 
         base_ccy = symbol.split('-')[0].upper()
-        if ct_val_ccy in [base_ccy, "BTC", "ETH", "SOL", "XRP", "DOGE", "LINK", "AVAX", "SUI", "BNB"]:
-            contract_nominal_quote = ct_val * current_price
-        elif ct_val_ccy in ["USD", "USDC", "USDT"]:
+        if ct_val_ccy in ["USD", "USDC", "USDT"] or is_usd_ct:
             contract_nominal_quote = ct_val
+        elif ct_val_ccy in [base_ccy, "BTC", "ETH", "SOL", "XRP"]:
+            contract_nominal_quote = ct_val * current_price
         else:
-            return 0.0, 0.0
+            contract_nominal_quote = ct_val * current_price
 
         if contract_nominal_quote <= 0:
             return 0.0, 0.0
@@ -1379,19 +1445,66 @@ class OKXFuturesClient:
         return None
 
     async def get_macro_candles_raw(self, symbol: str, bar: str = "15m", limit: int = 100) -> List[List[str]]:
-        await self.limiter_public.consume()
-        request_path = f"/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
-        url = f"{self.base_url}{request_path}"
-        headers = {"Content-Type": "application/json"}
-        if self.is_sandbox:
-            headers["x-simulated-trading"] = "1"
-        try:
-            async with self.session.get(url, headers=headers, timeout=5) as resp:
-                data = await resp.json()
-                if data.get("code") == "0" and data.get("data"):
-                    return list(reversed(data["data"]))
-        except Exception as e:
-            logger.error(f"[OKX-CANDLES] {e}")
+        collected = []
+        after_ts = None
+        remaining = limit
+
+        while remaining > 0:
+            fetch_sz = min(remaining, 100)
+            await self.limiter_public.consume()
+            request_path = f"/api/v5/market/candles?instId={symbol}&bar={bar}&limit={fetch_sz}"
+            if after_ts:
+                request_path += f"&after={after_ts}"
+            url = f"{self.base_url}{request_path}"
+            headers = {"Content-Type": "application/json"}
+            if self.is_sandbox:
+                headers["x-simulated-trading"] = "1"
+            try:
+                async with self.session.get(url, headers=headers, timeout=5) as resp:
+                    data = await resp.json()
+                    if data.get("code") == "0" and data.get("data"):
+                        batch = data["data"]
+                        collected.extend(batch)
+                        after_ts = batch[-1][0]
+                        remaining -= len(batch)
+                        if len(batch) < fetch_sz:
+                            break
+                    else:
+                        break
+            except Exception as e:
+                logger.error(f"[OKX-CANDLES] {symbol} {bar}: {e}")
+                break
+
+        if not collected:
+            return []
+
+        dedup = {c[0]: c for c in collected}
+        sorted_candles = [dedup[k] for k in sorted(dedup.keys(), key=lambda x: int(x))]
+        return sorted_candles
+
+    async def get_macro_candles_cached(
+        self,
+        symbol: str,
+        bar: str = "15m",
+        limit: int = 100,
+        cache_ttl_sec: float = 0.0
+    ) -> List[List[str]]:
+        now = time.monotonic()
+        cache_key = f"{symbol}_{bar}"
+
+        if cache_ttl_sec > 0:
+            cached = self._candles_cache.get(cache_key)
+            if cached and (now - cached["ts"]) < cache_ttl_sec and len(cached["data"]) >= min(limit, 100):
+                return cached["data"]
+
+        data = await self.get_macro_candles_raw(symbol, bar=bar, limit=limit)
+        if data and len(data) > 0:
+            self._candles_cache[cache_key] = {"data": data, "ts": now}
+            return data
+        elif cache_key in self._candles_cache:
+            logger.warning(f"⚠️ [CACHE-RETAINED] {symbol} {bar}: Użycie poprzedniego bufora z powodu chwilowego błędu sieci.")
+            return self._candles_cache[cache_key]["data"]
+
         return []
 
     async def check_spread_allowed(self, symbol: str, max_spread_pct: float = 0.0020) -> Tuple[bool, float]:
@@ -1797,14 +1910,13 @@ class OKXFuturesClient:
 
         pending_algos = await self.get_pending_algo_orders(symbol, ord_type="oco")
         if pending_algos is None:
-            logger.critical(f"🚨 [PROTECTION-UNKNOWN] {symbol}: Stan OCO nieznany (Timeout/Błąd API). Zakaz składania drugiego OCO!")
+            logger.critical(f"🚨 [PROTECTION-UNKNOWN] {symbol}: Stan OCO nieznany (Timeout/Błąd API). Zakaz drugiego OCO!")
             return "PROTECTION_UNKNOWN", None
 
         matched = next((a for a in pending_algos if a.get("algoClOrdId") == attach_algo_cl_ord_id), None)
         if matched and matched.get("algoId"):
             return "PROTECTED", matched.get("algoId")
 
-        # [D18 Fix] Unikalne ID dla Standalone OCO z prefiksem S w celu wykluczenia kolizji
         standalone_cl_id = generate_cl_ord_id("S", symbol.split('-')[0])
         logger.warning(f"⚠️ [ATTACHED-NOT-FOUND] {symbol}: Brak attached OCO potwierdzony. Składanie Standalone OCO ({standalone_cl_id})...")
         standalone_res = await self.execute_futures_oco(
@@ -1833,7 +1945,6 @@ async def reconcile_and_timestop_futures(
     if not pos_data:
         return False, None
 
-    # [D8 Fix] Reconcile nie przetwarza pozycji w trakcie skladania zlecenia wejscia
     pos_state = pos_data.get("state", "PROTECTED")
     if pos_state in ["ENTRY_SUBMITTED", "ENTRY_UNKNOWN"]:
         return False, None
@@ -1857,7 +1968,7 @@ async def reconcile_and_timestop_futures(
     margin_locked = float(pos_data.get("position", {}).get("marginLocked") or pos_data.get("margin_locked", 1.0))
     be_active = pos_data.get("beActivated") or pos_data.get("be_activated", False)
 
-    max_timeout = CONFIG["TIMEOUTS"].get(pos_data.get("strategy", "4TF_SNIPER_CORE"), 28800)
+    max_timeout = CONFIG["TIMEOUTS"].get(pos_data.get("strategy", "M15_CHOCH"), 172800)
 
     if actual_pos_on_exchange == 0.0:
         pos_data["state"] = "FLAT_PENDING_SETTLEMENT"
@@ -1870,6 +1981,7 @@ async def reconcile_and_timestop_futures(
                 break
             await asyncio.sleep(1.0)
 
+        close_reason = pos_data.get("closeReason", "NORMAL")
         await redis_trade.delete_key(pos_key)
 
         if real_pos_history and real_pos_history.get("close_avg_px", 0.0) > 0.0:
@@ -1877,22 +1989,25 @@ async def reconcile_and_timestop_futures(
             pnl_net = round(real_pos_history["realized_pnl"], 2)
             roe_net = round(real_pos_history["pnl_ratio"], 2)
         else:
-            exit_p = actual_px if actual_px and actual_px > 0 else (sl_p if pos_side == "long" else tp_p)
+            exit_p = pos_data.get("timeStopExitPx") or (actual_px if actual_px and actual_px > 0 else (sl_p if pos_side == "long" else tp_p))
             spec = inst["client"].instruments_cache.get(inst["symbol"], {"ctVal": 1.0, "ctValCcy": ""})
             ct_val = float(spec.get("ctVal", 1.0))
             ct_val_ccy = str(spec.get("ctValCcy", "")).upper()
             mult = 1.0 if pos_side == "long" else -1.0
-            # [D14 Fix] Prawidlowa wycena PnL z uwzglednieniem jednostki kontraktu
-            if ct_val_ccy in ["USD", "USDC", "USDT"]:
+            if ct_val_ccy in ["USD", "USDC", "USDT"] or inst.get("is_usd_ct", False):
                 pnl_gross = ((exit_p - entry_p) / entry_p) * mult * contracts * ct_val if entry_p > 0 else 0.0
             else:
                 pnl_gross = (exit_p - entry_p) * mult * contracts * ct_val
             pnl_net = round(pnl_gross - (margin_locked * 0.001), 2)
             roe_net = round((pnl_net / margin_locked) * 100.0, 2) if margin_locked > 0 else 0.0
 
-        icon = "🎉 <b>[ZYSK TAKE PROFIT]" if pnl_net >= 0 else "🛑 <b>[STOP LOSS / WYJŚCIE]"
+        if close_reason == "TIME_STOP_48H":
+            icon = "⏳ <b>[ZAMKNIĘCIE TIME-STOP 48H]"
+        else:
+            icon = "🎉 <b>[ZYSK TAKE PROFIT]" if pnl_net >= 0 else "🛑 <b>[STOP LOSS / WYJŚCIE]"
+
         cooldown_msg = ""
-        if pnl_net < 0:
+        if pnl_net < 0 and close_reason != "TIME_STOP_48H":
             await redis_trade.set_cooldown("GLOBAL_PORTFOLIO_QUARANTINE", CONFIG["SAFETY_GUARDS"]["SL_QUARANTINE_SECONDS"])
             await redis_trade.set_cooldown(inst["base"], CONFIG["SAFETY_GUARDS"]["SL_COOLDOWN_SECONDS"])
             cooldown_msg = "\n⏳ Nałożono globalną kwarantannę po stracie."
@@ -1902,14 +2017,14 @@ async def reconcile_and_timestop_futures(
             start_eq = await redis_trade.get_daily_start_equity(today_str)
             if start_eq is None or start_eq <= 0:
                 wallet_cb = await inst["client"].get_wallet_balances(QUOTE_CCY)
-                start_eq = wallet_cb.get("total_equity", 360.0) if wallet_cb else 360.0
+                start_eq = wallet_cb.get("total_equity", 332.63) if wallet_cb else 332.63
 
             cb_limit = start_eq * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]
             if accum_loss >= cb_limit:
                 await redis_trade.set_circuit_breaker(True)
                 await tg.push(f"🚨 <b>[CIRCUIT BREAKER AKTYWNY]</b> Strata dzisiejsza {accum_loss:.2f} >= {cb_limit:.2f} {QUOTE_CCY}. Odcięcie zasilania do 00:00 UTC.")
 
-        strat_display = pos_data.get("strategy", "4TF_SNIPER_CORE")
+        strat_display = pos_data.get("strategy", "M15_CHOCH")
         await tg.push(
             f"{icon} • {inst['label']}</b>\n"
             f"Strategia: <b>{strat_display}</b> [{pos_side.upper()}]\n"
@@ -1922,7 +2037,7 @@ async def reconcile_and_timestop_futures(
         ticker = await inst["client"].get_market_ticker(inst["symbol"])
         current_market_price = float(ticker.get("last", 0.0)) if ticker else 0.0
         if current_market_price > 0.0:
-            be_ratio = CONFIG["DYNAMIC_RISK"].get("BREAK_EVEN_TRIGGER_RATIO", 0.75)
+            be_ratio = CONFIG["DYNAMIC_RISK"].get("BREAK_EVEN_TRIGGER_RATIO", 0.80)
             fee_buffer_pct = CONFIG["DYNAMIC_RISK"].get("BREAK_EVEN_FEE_BUFFER_PCT", 0.0010)
             spec = inst["client"].instruments_cache.get(inst["symbol"], {"tickSz": 0.1})
             tick_sz = spec["tickSz"]
@@ -1952,14 +2067,18 @@ async def reconcile_and_timestop_futures(
                     await redis_trade.set_position_state(pos_key, pos_data)
                     await tg.push(f"🛡️ <b>[DYNAMIC BREAK-EVEN: {inst['label']}]</b> SL przesunięty na <code>{new_sl_px} {QUOTE_CCY}</code>")
 
-    # [D13 Fix] Prawidlowa sekwencja Time-Stop: najpierw zrzut rynkowy reduceOnly, po potwierdzeniu anulowanie algo
     if (time.time() - opened_at) > max_timeout:
-        logger.warning(f"⏳ [TIME-STOP] Pozycja {inst['label']} [{pos_side}] przekroczyła {round(max_timeout/3600, 1)}h. Zamykanie...")
+        logger.warning(f"⏳ [TIME-STOP] Pozycja {inst['label']} [{pos_side}] przekroczyła {round(max_timeout/3600, 1)}h (48h limit). Zamykanie...")
+        ticker = await inst["client"].get_market_ticker(inst["symbol"])
+        mkt_px = float(ticker.get("last", entry_p)) if ticker else entry_p
+
         flatten_ok = await inst["client"].emergency_flatten_position(inst["symbol"], pos_side)
         if flatten_ok:
             if algo_id not in ["EXT_MANUAL", "NONE"]:
                 await inst["client"].cancel_algo_order(inst["symbol"], algo_id)
             pos_data["state"] = "FLAT_PENDING_SETTLEMENT"
+            pos_data["closeReason"] = "TIME_STOP_48H"
+            pos_data["timeStopExitPx"] = mkt_px
             await redis_trade.set_position_state(pos_key, pos_data)
             return True, pos_key
         else:
@@ -1970,8 +2089,29 @@ async def reconcile_and_timestop_futures(
 
     return False, None
 
+async def protection_reconciler_worker(redis_trade, tg, okx_client):
+    logger.info("🛡️ [RECONCILER-WORKER] Dedykowana pętla monitorowania pozycji i ochrony OCO Online (interwał 15s).")
+    while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
+        try:
+            if IS_MASTER_ENGINE_NODE:
+                active_keys = await redis_trade.get_active_positions()
+                for k in active_keys:
+                    pos_data = await redis_trade.get_position_state(k)
+                    if not pos_data:
+                        continue
+                    sym = pos_data.get("instId")
+                    pos_side = pos_data.get("posSide", "long").lower()
+                    inst = next((item for item in FUTURES_INSTRUMENTS if item["symbol"] == sym), None)
+                    if inst:
+                        inst_variant = {**inst, "client": okx_client}
+                        await reconcile_and_timestop_futures(inst_variant, pos_side, redis_trade, tg)
+        except Exception as e:
+            logger.error(f"❌ [RECONCILER-LOOP-ERR] {e}")
+        finally:
+            await interruptible_sleep(15)
+
 async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, smart_money_oracle):
-    logger.info("🎯 [4-TF SNIPER] Centralny Arbiter Portfelowy v17.9-MULTI-ASSET Online.")
+    logger.info("🎯 [M15 CHOCH SNIPER] Silnik Strategiczny v18.0 (CHoCH + H1 Swing Low) Online.")
     scan_counter = 0
 
     while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
@@ -1998,7 +2138,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
             start_equity = await redis_trade.get_daily_start_equity(today_str)
             if start_equity is None or start_equity <= 0:
                 wallet_check = await okx_client.get_wallet_balances(QUOTE_CCY)
-                start_equity = wallet_check.get("total_equity", 360.0) if wallet_check else 360.0
+                start_equity = wallet_check.get("total_equity", 332.63) if wallet_check else 332.63
 
             cb_threshold = start_equity * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"]
             if daily_loss >= cb_threshold:
@@ -2007,13 +2147,14 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                 await interruptible_sleep(60)
                 continue
 
-            # [D2 Fix] Skanowanie koszyka 9 monet i budowa kolejki posortowanej po dominacji
             candidates: List[Dict[str, Any]] = []
             scan_counter += 1
-            is_verbose_cycle = (scan_counter % 10 == 0)
+            is_verbose_cycle = (scan_counter % 4 == 0)
 
             if is_verbose_cycle:
-                logger.info(f"🔍 [4-TF-SCAN] Skanowanie koszyka 9 monet (Sloty: {len(active_keys)}/{CONFIG['ALPHA_MAX_ACTIVE_SLOTS']})...")
+                logger.info(f"🔍 [M15-CHOCH-SCAN] Skanowanie koszyka (Sloty: {len(active_keys)}/{CONFIG['ALPHA_MAX_ACTIVE_SLOTS']})...")
+
+            now_scan_ts = time.time()
 
             for conf in FUTURES_INSTRUMENTS:
                 if not IS_MASTER_ENGINE_NODE:
@@ -2037,21 +2178,29 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         logger.warning(f"   ⮡ [FILTER-SPREAD] {base}: Spread {round(spread_val*100, 3)}% > MAX ({CONFIG['SAFETY_GUARDS']['MAX_SPREAD_PCT']*100}%).")
                     continue
 
-                c4h, c1h, c15m, c5m = await asyncio.gather(
-                    okx_client.get_macro_candles_raw(sym, bar="4H", limit=250),
-                    okx_client.get_macro_candles_raw(sym, bar="1H", limit=100),
-                    okx_client.get_macro_candles_raw(sym, bar="15m", limit=150),
-                    okx_client.get_macro_candles_raw(sym, bar="5m", limit=100)
+                c4h, c1h, c15m = await asyncio.gather(
+                    okx_client.get_macro_candles_cached(sym, bar="4H", limit=250, cache_ttl_sec=900.0),
+                    okx_client.get_macro_candles_cached(sym, bar="1H", limit=100, cache_ttl_sec=300.0),
+                    okx_client.get_macro_candles_cached(sym, bar="15m", limit=100, cache_ttl_sec=0.0)
                 )
 
-                if len(c4h) < 205 or len(c1h) < 60 or len(c15m) < 40 or len(c5m) < 20:
+                if len(c4h) < 205 or len(c1h) < 60 or len(c15m) < 40:
                     if is_verbose_cycle:
-                        logger.warning(f"   ⮡ [DATA-INSUFFICIENT] {base}: Za mało świec (H4:{len(c4h)}, H1:{len(c1h)}, M15:{len(c15m)}, M5:{len(c5m)}).")
+                        logger.warning(f"   ⮡ [DATA-INSUFFICIENT] {base}: Za mało świec (H4:{len(c4h)}, H1:{len(c1h)}, M15:{len(c15m)}).")
                     continue
 
-                closes_4h = [float(c[4]) for c in c4h[:-1]]
-                closes_1h = [float(c[4]) for c in c1h[:-1]]
-                closes_15m = [float(c[4]) for c in c15m[:-1]]
+                c4h_closed, _ = get_strictly_closed_candles_slice(c4h, 14400, now_scan_ts)
+                c1h_closed, _ = get_strictly_closed_candles_slice(c1h, 3600, now_scan_ts)
+                c15m_closed, _ = get_strictly_closed_candles_slice(c15m, 900, now_scan_ts)
+
+                if not c4h_closed or not c1h_closed or not c15m_closed:
+                    if is_verbose_cycle:
+                        logger.warning(f"   ⮡ [TIMING-DESYNC] {base}: Rozbieżność znaczników czasu świec zamkniętych.")
+                    continue
+
+                closes_4h = [float(c[4]) for c in c4h_closed]
+                closes_1h = [float(c[4]) for c in c1h_closed]
+                volumes_1h = [float(c[5]) for c in c1h_closed]
 
                 ema50_4h_list = calc_ema(closes_4h, 50)
                 ema200_4h_list = calc_ema(closes_4h, 200)
@@ -2065,7 +2214,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                 
                 if not h4_bull and not h4_bear:
                     if is_verbose_cycle:
-                        logger.info(f"   ⮡ [H4-NEUTRAL] {base}: Brak silnego trendu makro.")
+                        logger.info(f"   ⮡ [H4-NEUTRAL] {base}: Brak silnego trendu makro H4.")
                     continue
 
                 ema50_1h = calc_ema(closes_1h, 50)[-1]
@@ -2080,39 +2229,44 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         logger.info(f"   ⮡ [H1-DISCORD] {base}: Kierunek H1 niezgodny z H4.")
                     continue
 
-                ema20_15m = calc_ema(closes_15m, 20)[-1]
-                dist_to_ema_15m = abs(closes_15m[-1] - ema20_15m) / closes_15m[-1]
-                if dist_to_ema_15m >= 0.0035:
+                vol_sma20_1h = sum(volumes_1h[-20:]) / 20.0 if len(volumes_1h) >= 20 else (volumes_1h[-1] if volumes_1h else 0.0)
+                last_vol_1h = volumes_1h[-1] if volumes_1h else 0.0
+                vsa_panic = last_vol_1h > (1.35 * vol_sma20_1h) if vol_sma20_1h > 0 else False
+                if vsa_panic:
                     if is_verbose_cycle:
-                        logger.info(f"   ⮡ [M15-OVEREXTENDED] {base}: Dystans do EMA20 {round(dist_to_ema_15m*100, 3)}% >= 0.35%.")
+                        logger.info(f"   ⮡ [H1-VSA-PANIC] {base}: Wolumen paniki H1 ({last_vol_1h:.1f} > 1.35x {vol_sma20_1h:.1f}).")
                     continue
 
-                m5_closed = c5m[-2]
-                m5_o, m5_h, m5_l, m5_c = float(m5_closed[1]), float(m5_closed[2]), float(m5_closed[3]), float(m5_closed[4])
-                range_m5 = m5_h - m5_l
-                dominance = abs(m5_c - m5_o) / range_m5 if range_m5 > 0 else 0.0
-                if dominance <= 0.60:
-                    if is_verbose_cycle:
-                        logger.info(f"   ⮡ [M5-WEAK-BODY] {base}: Dominacja korpusu {round(dominance*100, 1)}% <= 60%.")
-                    continue
+                c15m_close = float(c15m_closed[-1][4])
+                c15m_open = float(c15m_closed[-1][1])
 
-                sig_long = h4_bull and h1_bull and (m5_c > m5_o)
-                sig_short = h4_bear and h1_bear and (m5_c < m5_o)
+                signal_long = False
+                signal_short = False
+                rank_score = 0.0
 
-                if sig_long or sig_short:
-                    tactical = "TREND_PULLBACK" if dist_to_ema_15m <= 0.0018 else "4TF_SNIPER_CORE"
-                    logger.info(f"🎯 [POTENTIAL-SIGNAL] {conf['label']} spełnił 4 ekrany! (Strona: {'LONG' if sig_long else 'SHORT'}, Dominacja: {round(dominance*100, 1)}%)")
+                if h4_bull and h1_bull:
+                    m15_swing_high = find_m15_recent_swing_high(c15m_closed, lookback=16)
+                    if m15_swing_high and c15m_close > m15_swing_high and c15m_close > c15m_open:
+                        signal_long = True
+                        rank_score = (c15m_close - m15_swing_high) / c15m_close
+
+                elif h4_bear and h1_bear:
+                    m15_swing_low = find_m15_recent_swing_low(c15m_closed, lookback=16)
+                    if m15_swing_low and c15m_close < m15_swing_low and c15m_close < c15m_open:
+                        signal_short = True
+                        rank_score = (m15_swing_low - c15m_close) / c15m_close
+
+                if signal_long or signal_short:
+                    logger.info(f"🎯 [M15-CHOCH-SIGNAL] {conf['label']} wybił strukturę CHoCH! (Kierunek: {'LONG' if signal_long else 'SHORT'}, Wynik Rank: {round(rank_score*100, 3)}%)")
                     candidates.append({
                         "symbol": sym, "base": base, "conf": conf,
-                        "side": "long" if sig_long else "short",
-                        "dominance": dominance, "c5m_full": c5m[:-1],
-                        "strategy": tactical
+                        "side": "long" if signal_long else "short",
+                        "rank_score": rank_score, "c1h_closed": c1h_closed,
+                        "strategy": "M15_CHOCH"
                     })
 
-            # [D2 Fix] Sortowanie kandydatow po dominacji korpusu (od najlepszego)
-            candidates.sort(key=lambda x: x["dominance"], reverse=True)
+            candidates.sort(key=lambda x: x["rank_score"], reverse=True)
 
-            # Iterujemy po kandydatach – jesli lider nie przejdzie sizingu, sprawdzamy kolejnych!
             for best_signal in candidates:
                 if not IS_MASTER_ENGINE_NODE:
                     break
@@ -2122,8 +2276,13 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                 conf = best_signal["conf"]
                 pos_side = best_signal["side"]
                 strategy_name = best_signal["strategy"]
+                c1h_closed_ref = best_signal["c1h_closed"]
 
-                sm_ok, sm_note, _ = await smart_money_oracle.check_smart_money_alignment(base, pos_side)
+                if CONFIG["SAFETY_GUARDS"].get("SMART_MONEY", {}).get("BYPASS_PULLBACK", True) and strategy_name in ["M15_CHOCH", "TREND_PULLBACK"]:
+                    sm_ok, sm_note = True, "BYPASS_CHOCH_STRATEGY_ACTIVE"
+                else:
+                    sm_ok, sm_note, _ = await smart_money_oracle.check_smart_money_alignment(base, pos_side)
+
                 if not sm_ok:
                     logger.warning(f"🐳 [SMART-MONEY] Odrzucono sygnał {conf['label']}: {sm_note}")
                     continue
@@ -2155,10 +2314,18 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         continue
                     tick_sz = spec.get("tickSz", 0.1)
 
-                    atr_5m = calc_atr(best_signal["c5m_full"], 14)
-                    price_sl, price_tp, sl_eff_pct = calculate_clamped_sl_tp(
-                        entry_live_price, atr_5m, atr_mult=1.5, rr_ratio=2.0,
-                        tick_sz=tick_sz, pos_side=pos_side
+                    cushion_val = 0.0025 if base == "BTC" else 0.0015
+                    price_sl, price_tp, sl_eff_pct = find_structural_h1_swing_sl(
+                        candles_1h=c1h_closed_ref,
+                        entry_price=entry_live_price,
+                        pos_side=pos_side,
+                        tick_sz=tick_sz,
+                        lookback_bars=40,
+                        pivot_radius=2,
+                        cushion_pct=cushion_val,
+                        min_sl_pct=0.012,
+                        max_sl_pct=0.035,
+                        rr_ratio=1.8
                     )
 
                     risk_capital = available_cash * CONFIG["RISK_PER_TRADE_PCT"]
@@ -2169,7 +2336,13 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         safe_cash * 0.95
                     )
 
-                    contracts, actual_margin = okx_client.calculate_contract_size(sym, entry_live_price, target_margin, safe_cash)
+                    contracts, actual_margin = okx_client.calculate_contract_size(
+                        symbol=sym,
+                        current_price=entry_live_price,
+                        target_margin_quote=target_margin,
+                        max_allowed_margin=safe_cash,
+                        is_usd_ct=conf.get("is_usd_ct", False)
+                    )
                     if contracts <= 0 or actual_margin > available_cash:
                         await redis_trade.clear_cooldown("PORTFOLIO_STAGGER_LOCK")
                         continue
@@ -2232,7 +2405,6 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                     real_fill_px = pos_details["avgPx"] if pos_details["avgPx"] > 0 else entry_live_price
                     actual_pos_margin = pos_details["margin"] if pos_details["margin"] > 0 else actual_margin
 
-                    # [D6 Fix] Aktualizacja zlecen na gieldzie po poslizgu cenowym
                     slippage = abs(real_fill_px - entry_live_price) / entry_live_price
                     if slippage > CONFIG["MAX_ENTRY_SLIPPAGE_PCT"]:
                         ct_val = spec.get("ctVal", 1.0)
@@ -2240,7 +2412,6 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         monetary_risk = real_size * raw_dist * ct_val
                         max_allowed_risk = available_cash * CONFIG["HARD_RISK_CAP_ON_SLIPPAGE_PCT"]
 
-                        # [D3 Fix] Obsluga bledu awaryjnego zrzutu – brak bezmyslnego kasowania klucza
                         if monetary_risk > max_allowed_risk:
                             logger.critical(f"🔥 [SLIPPAGE-ABORT] {sym}: Ryzyko ({monetary_risk:.2f}) > limit ({max_allowed_risk:.2f}). Natychmiastowy zrzut!")
                             flatten_ok = await okx_client.emergency_flatten_position(sym, pos_side)
@@ -2255,8 +2426,17 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                             await redis_trade.clear_cooldown("PORTFOLIO_STAGGER_LOCK")
                             continue
                         else:
-                            price_sl, price_tp, sl_eff_pct = calculate_clamped_sl_tp(
-                                real_fill_px, atr_5m, 1.5, 2.0, tick_sz, pos_side
+                            price_sl, price_tp, sl_eff_pct = find_structural_h1_swing_sl(
+                                candles_1h=c1h_closed_ref,
+                                entry_price=real_fill_px,
+                                pos_side=pos_side,
+                                tick_sz=tick_sz,
+                                lookback_bars=40,
+                                pivot_radius=2,
+                                cushion_pct=cushion_val,
+                                min_sl_pct=0.012,
+                                max_sl_pct=0.035,
+                                rr_ratio=1.8
                             )
 
                     prot_state, real_algo_id = await okx_client.ensure_position_protection(
@@ -2270,7 +2450,6 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         attach_algo_cl_ord_id=my_algo_cl_id
                     )
 
-                    # [D3 Fix] Brak cichego kasowania stanu w razie odrzucenia ochrony
                     if prot_state != "PROTECTED" or not real_algo_id:
                         logger.critical(f"🔥 [UNPROTECTED-ABORT] {sym}: Ochrona OCO niepotwierdzona. Awaryjny zrzut pozycji.")
                         flatten_ok = await okx_client.emergency_flatten_position(sym, pos_side)
@@ -2285,7 +2464,6 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         await redis_trade.clear_cooldown("PORTFOLIO_STAGGER_LOCK")
                         continue
 
-                    # [D6 Fix] Jesli nastapil poslizg, modyfikujemy aktywne OCO na gieldzie pod nowe ceny
                     if slippage > CONFIG["MAX_ENTRY_SLIPPAGE_PCT"]:
                         await okx_client.amend_algo_order(sym, real_algo_id, new_sl_trigger_px=format_px(price_sl, tick_sz))
 
@@ -2315,20 +2493,22 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                     await redis_trade.set_position_state(canonical_pos_key, canonical_record)
 
                     await tg.push(
-                        f"🎯 <b>[4-TF SNIPER ENTRY: {conf['label']}]</b>\n"
+                        f"🎯 <b>[M15 CHOCH ENTRY: {conf['label']}]</b>\n"
                         f"Taktyka: <b>{strategy_name}</b> [{pos_side.upper()} 3x Izolowany]\n"
                         f"Kurs: <b>{real_fill_px} {QUOTE_CCY}</b> | Margines: ~{actual_pos_margin} {QUOTE_CCY}\n"
                         f"Kontrakty: <b>{format_sz(real_size)} sz</b>\n"
-                        f"🎯 TP: <code>{price_tp}</code> | 🛑 SL: <code>{price_sl}</code>\n"
+                        f"🎯 TP (1.8R): <code>{price_tp}</code> | 🛑 SL (H1 Swing): <code>{price_sl}</code>\n"
                         f"🛡️ <b>Stan: PROTECTED (OKX OCO Algo ID: {real_algo_id})</b>\n"
                         f"🐳 Smart Money: <code>{sm_note}</code>"
                     )
                     break
         except Exception as e:
-            logger.error(f"❌ [4-TF SNIPER ERROR] {e}")
+            logger.error(f"❌ [M15 CHOCH SNIPER ERROR] {e}")
         finally:
-            # [D2 Fix] Gwarantowany sen taktujacy – zero busy-waiting
-            await interruptible_sleep(45)
+            now_ts = time.time()
+            rem_sec = now_ts % 900
+            sleep_sec = (900.0 - rem_sec) + 4.0
+            await interruptible_sleep(sleep_sec)
 
 async def master_lock_heartbeat_worker(redis_trade):
     global IS_MASTER_ENGINE_NODE
@@ -2346,7 +2526,7 @@ async def master_lock_heartbeat_worker(redis_trade):
                 break
 
 async def master_bootstrap(redis_trade, okx_client, session):
-    logger.info("🚀 [MASTER-BOOTSTRAP] Inicjalizacja środowiska Master Engine (9 Instrumentów)...")
+    logger.info("🚀 [MASTER-BOOTSTRAP] Inicjalizacja środowiska Master Engine (M15 CHoCH Baseline)...")
     await redis_trade.init_sync()
     await okx_client.set_position_mode("long_short_mode")
 
@@ -2360,7 +2540,7 @@ async def master_bootstrap(redis_trade, okx_client, session):
         await okx_client.set_leverage(resolved, TARGET_LEVERAGE, "short")
 
     wallet_init = await okx_client.get_wallet_balances(QUOTE_CCY)
-    init_eq = wallet_init.get("total_equity", 360.0) if wallet_init else 360.0
+    init_eq = wallet_init.get("total_equity", 332.63) if wallet_init else 332.63
     today_str = datetime.now(UTC).strftime('%Y%m%d')
     base_eq_key = redis_trade._enforce_prefix(f"DAILY_START_EQUITY:{today_str}")
     try:
@@ -2377,8 +2557,9 @@ async def master_bootstrap(redis_trade, okx_client, session):
         await okx_client.limiter_account.consume()
         async with session.get(f"{okx_client.base_url}{req_pos_path}", headers=headers_p, timeout=6) as r_p:
             p_data = await r_p.json()
-            if p_data.get("code") == "0" and p_data.get("data"):
+            if p_data.get("code") == "0" and p_data.get("data") is not None:
                 configured_symbols = {item["symbol"] for item in FUTURES_INSTRUMENTS}
+                configured_symbols_with_open_pos = []
                 for pos_item in p_data["data"]:
                     pos_sz = abs(float(pos_item.get("pos", 0.0) or 0.0))
                     pos_inst = pos_item.get("instId")
@@ -2393,6 +2574,7 @@ async def master_bootstrap(redis_trade, okx_client, session):
                     margin_val = float(pos_item.get("margin", 50.0) or 50.0)
 
                     if pos_sz > 0.0 and pos_inst:
+                        configured_symbols_with_open_pos.append(pos_inst)
                         canonical_key = get_canonical_pos_key(redis_trade.prefix, pos_inst, pos_side)
                         existing_st = await redis_trade.get_position_state(canonical_key)
                         if not existing_st:
@@ -2403,15 +2585,16 @@ async def master_bootstrap(redis_trade, okx_client, session):
 
                             matching_algos = [a for a in pending_algos if a.get("posSide", "").lower() == pos_side.lower()] if pending_algos else []
                             detected_algo_id = None
-                            detected_tp, detected_sl = avg_px * 1.02, avg_px * 0.98
+                            detected_tp, detected_sl = avg_px * 1.025, avg_px * 0.985
 
                             if matching_algos:
                                 detected_algo_id = matching_algos[0].get("algoId")
-                                detected_tp = float(matching_algos[0].get("tpTriggerPx", avg_px * 1.02))
-                                detected_sl = float(matching_algos[0].get("slTriggerPx", avg_px * 0.98))
+                                detected_tp = float(matching_algos[0].get("tpTriggerPx", avg_px * 1.025))
+                                detected_sl = float(matching_algos[0].get("slTriggerPx", avg_px * 0.985))
                             else:
                                 logger.critical(f"🚨 [NAKED-REHYDRATION] Pozycja {pos_inst}:{pos_side} bez OCO! Uzbrajanie...")
-                                p_sl, p_tp, _ = calculate_clamped_sl_tp(avg_px, 0.0, 0.0, 1.5, tick_sz, pos_side)
+                                p_sl = round_price_to_tick(avg_px * (1.0 - 0.018), tick_sz, "DOWN") if pos_side == "long" else round_price_to_tick(avg_px * (1.0 + 0.018), tick_sz, "UP")
+                                p_tp = round_price_to_tick(avg_px * (1.0 + 0.018 * 1.8), tick_sz, "UP") if pos_side == "long" else round_price_to_tick(avg_px * (1.0 - 0.018 * 1.8), tick_sz, "DOWN")
                                 oco_res = await okx_client.execute_futures_oco(pos_inst, pos_side, pos_sz, p_tp, p_sl, tick_sz=tick_sz)
                                 if oco_res and oco_res.get("code") == "0" and oco_res.get("data"):
                                     detected_algo_id = oco_res["data"][0].get("algoId")
@@ -2441,6 +2624,13 @@ async def master_bootstrap(redis_trade, okx_client, session):
                                 "updatedAt": time.time()
                             }
                             await redis_trade.set_position_state(canonical_key, rehydrated_record)
+
+                if len(configured_symbols_with_open_pos) == 0:
+                    await redis_trade.clear_cooldown("PORTFOLIO_STAGGER_LOCK")
+                    logger.info("🧹 [CLEAN-START] Portfel jest FLAT. Zdjęto blokadę Stagger Lock po restarcie.")
+            elif p_data.get("code") == "0" and (not p_data.get("data") or len(p_data.get("data")) == 0):
+                await redis_trade.clear_cooldown("PORTFOLIO_STAGGER_LOCK")
+                logger.info("🧹 [CLEAN-START] Portfel jest FLAT. Zdjęto blokadę Stagger Lock po restarcie.")
     except Exception as exc_rehyd:
         logger.error(f"⚠️ [REHYDRATION-FAILED]: {exc_rehyd}")
 
@@ -2462,6 +2652,7 @@ async def passive_leader_sentry_worker(redis_trade, tg, okx_client, smart_money_
                 await master_bootstrap(redis_trade, okx_client, okx_client.session)
                 IS_MASTER_ENGINE_NODE = True
                 spawn_supervised_task(master_lock_heartbeat_worker, "master_heartbeat_worker", redis_trade, tg=tg)
+                spawn_supervised_task(protection_reconciler_worker, "reconciler_worker", redis_trade, tg, okx_client)
                 spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", okx_client.session, redis_trade, tg, okx_client, smart_money_oracle, tg=tg)
                 if tg:
                     await tg.push("👑 <b>[LEADER PROMOTION]</b> Proces przejmuje rolę aktywnego MASTER Engine po zwolnieniu blokady.")
@@ -2489,16 +2680,9 @@ def spawn_supervised_task(coro_fn, name: str, *args, tg: Optional[TelegramThrott
                 break
             except Exception as exc:
                 restart_count += 1
-                logger.critical(f"💥 [SUPERVISOR-CRASH] '{name}' padł z błędem: {exc}. Restart za 5s...")
-                if tg and not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
-                    try:
-                        await tg.push(
-                            f"🚨 <b>[SUPERVISOR: AWARIA & RESTART]</b>\n"
-                            f"Worker: <code>{name}</code>\n"
-                            f"Błąd: <code>{exc}</code>"
-                        )
-                    except Exception:
-                        pass
+                logger.critical(f"💥 [SUPERVISOR] Awaria w '{name}' (#{restart_count}): {exc}. Restart za 5s...")
+                if tg:
+                    await tg.push(f"💥 <b>[SUPERVISOR ALERT]</b> Awaria zadania <code>{name}</code>: {exc}")
                 await asyncio.sleep(5)
 
     task = asyncio.create_task(_supervisor_wrapper(), name=name)
@@ -2506,147 +2690,98 @@ def spawn_supervised_task(coro_fn, name: str, *args, tg: Optional[TelegramThrott
     task.add_done_callback(BACKGROUND_TASKS.discard)
     return task
 
-async def continuous_async_cron(loop):
-    global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER_PUBLIC, RATE_LIMITER_TRADE, RATE_LIMITER_ACCOUNT
-    global GLOBAL_WS_FEED, GLOBAL_ALPHA_LOCK, GLOBAL_OKX_CLIENT, GLOBAL_REDIS_BRIDGE, GLOBAL_TG, GLOBAL_SMART_MONEY_ORACLE, IS_MASTER_ENGINE_NODE
-
-    logger.info(f"⚡ [ENGINE-START] Uruchamianie Silnika Futures 3x v17.9-MULTI-ASSET ({QUOTE_CCY})...")
-    ASYNC_SHUTDOWN_EVENT = asyncio.Event()
-    GLOBAL_ALPHA_LOCK = asyncio.Lock()
-
-    RATE_LIMITER_PUBLIC = TokenBucketRateLimiter(tokens_per_second=8.0, max_capacity=16.0)
-    RATE_LIMITER_TRADE = TokenBucketRateLimiter(tokens_per_second=4.0, max_capacity=8.0)
-    RATE_LIMITER_ACCOUNT = TokenBucketRateLimiter(tokens_per_second=2.0, max_capacity=4.0)
-
-    async with aiohttp.ClientSession() as session:
-        redis_trade = UpstashRedisFuturesBridge(
-            os.environ.get("UPSTASH_REDIS_REST_URL", ""),
-            os.environ.get("UPSTASH_REDIS_REST_TOKEN", ""),
-            session
-        )
-        tg = TelegramThrottledDispatcher(
-            os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-            os.environ.get("TELEGRAM_CHANNEL_ID", ""),
-            session
-        )
-        okx_client = OKXFuturesClient(
-            session, RATE_LIMITER_TRADE, RATE_LIMITER_PUBLIC, RATE_LIMITER_ACCOUNT, is_sandbox=IS_SANDBOX
-        )
-        smart_money_oracle = OKXSmartMoneyOracle(session, RATE_LIMITER_PUBLIC, is_sandbox=IS_SANDBOX)
-        ws_feed = OKXWebSocketPriceFeed(session, is_sandbox=IS_SANDBOX)
-
-        GLOBAL_WS_FEED = ws_feed
-        GLOBAL_OKX_CLIENT = okx_client
-        GLOBAL_REDIS_BRIDGE = redis_trade
-        GLOBAL_TG = tg
-        GLOBAL_SMART_MONEY_ORACLE = smart_money_oracle
-
-        acquired = await redis_trade.acquire_master_engine_lock(ENGINE_WORKER_ID, ttl_seconds=60)
-        if acquired or not os.environ.get("UPSTASH_REDIS_REST_URL"):
-            IS_MASTER_ENGINE_NODE = True
-            logger.info(f"👑 [MASTER-ENGINE-NODE] Proces {ENGINE_WORKER_ID} przejął rolę aktywnego silnika tradingu.")
-            symbols_to_stream = await master_bootstrap(redis_trade, okx_client, session)
-            spawn_supervised_task(master_lock_heartbeat_worker, "master_heartbeat_worker", redis_trade, tg=tg)
-            spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", session, redis_trade, tg, okx_client, smart_money_oracle, tg=tg)
-        else:
-            IS_MASTER_ENGINE_NODE = False
-            logger.info(f"👀 [PASSIVE-HTTP-NODE] Proces {ENGINE_WORKER_ID} działa jako węzeł pasywny. Oczekiwanie na awans...")
-            symbols_to_stream = [item["symbol"] for item in FUTURES_INSTRUMENTS]
-            spawn_supervised_task(passive_leader_sentry_worker, "passive_sentry_worker", redis_trade, tg, okx_client, smart_money_oracle, tg=tg)
-
-        spawn_supervised_task(ws_feed.start_listener, "ws_feed_listener", symbols_to_stream, tg=tg)
-
-        await tg.push(
-            f"🚀 <b>Silnik Futures 3x v17.9-MULTI-ASSET Online ({QUOTE_CCY})</b>\n"
-            f"Rola: <b>{'MASTER' if IS_MASTER_ENGINE_NODE else 'PASSIVE'}</b> | Koszyk: <b>9 par X-Perp</b>"
-        )
-
-        instruments_for_reconciler = [
-            {"client": okx_client, "symbol": item["symbol"], "base": item["base"], "label": item["label"], "price_round": item["price_round"]}
-            for item in FUTURES_INSTRUMENTS
-        ]
-
-        while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
-            try:
-                if IS_MASTER_ENGINE_NODE:
-                    for base_inst in instruments_for_reconciler:
-                        for side in ["long", "short"]:
-                            await reconcile_and_timestop_futures(base_inst, side, redis_trade, tg)
-
-                wallet_data = await okx_client.get_wallet_balances(QUOTE_CCY)
-                eq_total = wallet_data.get("total_equity", 0.0) if wallet_data else 0.0
-                cash_avail = wallet_data.get("available_cash", 0.0) if wallet_data else 0.0
-
-                today_str = datetime.now(UTC).strftime('%Y%m%d')
-                start_equity = await redis_trade.get_daily_start_equity(today_str)
-                if start_equity is None or start_equity <= 0:
-                    start_equity = eq_total
-
-                active_keys = await redis_trade.get_active_positions()
-                today_loss = await redis_trade.get_daily_loss()
-                max_loss_limit = round(start_equity * CONFIG["SAFETY_GUARDS"]["DAILY_CIRCUIT_BREAKER_PCT"], 2)
-
-                logger.info(
-                    f"💓 [HEARTBEAT-v17.9] Rola: {'MASTER' if IS_MASTER_ENGINE_NODE else 'PASSIVE'} | "
-                    f"Kapitał: {eq_total} {QUOTE_CCY} | Baza CB: {start_equity} | Wolne: {cash_avail} | "
-                    f"Sloty: {len(active_keys)}/{CONFIG['ALPHA_MAX_ACTIVE_SLOTS']} | "
-                    f"Strata: {today_loss}/{max_loss_limit} | Pauza: {GLOBAL_TRADING_PAUSED}"
-                )
-            except Exception as e:
-                logger.error(f"[HEARTBEAT-ERROR] {e}")
-
-            await interruptible_sleep(60)
-
 async def interruptible_sleep(seconds: float):
-    if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
+    if seconds <= 0:
         return
-    try:
-        if ASYNC_SHUTDOWN_EVENT:
-            await asyncio.wait_for(ASYNC_SHUTDOWN_EVENT.wait(), timeout=seconds)
-        else:
-            await asyncio.sleep(seconds)
-    except asyncio.TimeoutError:
-        pass
+    end_time = time.monotonic() + seconds
+    while time.monotonic() < end_time:
+        if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
+            break
+        step = min(1.0, end_time - time.monotonic())
+        if step > 0:
+            await asyncio.sleep(step)
 
-def _shutdown_watchdog():
-    SHUTDOWN_COMPLETE.wait(timeout=25)
-    if not SHUTDOWN_COMPLETE.is_set():
-        logger.critical("🛑 [SHUTDOWN-TIMEOUT] Wymuszone zakończenie procesu przez watchdog.")
-    os._exit(0)
+def background_async_loop():
+    global BACKGROUND_LOOP, GLOBAL_ALPHA_LOCK, ASYNC_SHUTDOWN_EVENT
+    global RATE_LIMITER_PUBLIC, RATE_LIMITER_TRADE, RATE_LIMITER_ACCOUNT
+    global GLOBAL_WS_FEED, GLOBAL_OKX_CLIENT, GLOBAL_REDIS_BRIDGE, GLOBAL_TG, GLOBAL_SMART_MONEY_ORACLE
+    global IS_MASTER_ENGINE_NODE
 
-def handle_exit_signal(sig, frame):
-    PROCESS_DRAINING.set()
-    logger.warning(f"🛑 [SHUTDOWN-SIGNAL] Odebrano sygnał {sig}. Rozpoczynanie czystego zamykania...")
-    if BACKGROUND_LOOP and BACKGROUND_LOOP.is_running():
-        if IS_MASTER_ENGINE_NODE and GLOBAL_REDIS_BRIDGE:
-            asyncio.run_coroutine_threadsafe(GLOBAL_REDIS_BRIDGE.release_master_engine_lock(ENGINE_WORKER_ID), BACKGROUND_LOOP)
-        if ASYNC_SHUTDOWN_EVENT:
-            BACKGROUND_LOOP.call_soon_threadsafe(ASYNC_SHUTDOWN_EVENT.set)
-    threading.Thread(target=_shutdown_watchdog, daemon=True).start()
+    BACKGROUND_LOOP = asyncio.new_event_loop()
+    asyncio.set_event_loop(BACKGROUND_LOOP)
 
-signal.signal(signal.SIGTERM, handle_exit_signal)
-signal.signal(signal.SIGINT, handle_exit_signal)
+    GLOBAL_ALPHA_LOCK = asyncio.Lock()
+    ASYNC_SHUTDOWN_EVENT = asyncio.Event()
+
+    RATE_LIMITER_PUBLIC = TokenBucketRateLimiter(tokens_per_second=5.0, max_capacity=10.0)
+    RATE_LIMITER_TRADE = TokenBucketRateLimiter(tokens_per_second=4.0, max_capacity=8.0)
+    RATE_LIMITER_ACCOUNT = TokenBucketRateLimiter(tokens_per_second=4.0, max_capacity=8.0)
+
+    async def _runner():
+        global IS_MASTER_ENGINE_NODE
+        async with aiohttp.ClientSession() as session:
+            tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+            tg_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+            GLOBAL_TG = TelegramThrottledDispatcher(tg_token, tg_chat, session)
+
+            upstash_url = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
+            upstash_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+            GLOBAL_REDIS_BRIDGE = UpstashRedisFuturesBridge(upstash_url, upstash_token, session)
+
+            GLOBAL_OKX_CLIENT = OKXFuturesClient(session, RATE_LIMITER_TRADE, RATE_LIMITER_PUBLIC, RATE_LIMITER_ACCOUNT, is_sandbox=IS_SANDBOX)
+            GLOBAL_SMART_MONEY_ORACLE = OKXSmartMoneyOracle(session, RATE_LIMITER_PUBLIC, is_sandbox=IS_SANDBOX)
+            GLOBAL_WS_FEED = OKXWebSocketPriceFeed(session, is_sandbox=IS_SANDBOX)
+
+            logger.info("🌐 [STARTUP] Próba przejęcia roli MASTER...")
+            acquired = await GLOBAL_REDIS_BRIDGE.acquire_master_engine_lock(ENGINE_WORKER_ID, ttl_seconds=60)
+            
+            if acquired:
+                IS_MASTER_ENGINE_NODE = True
+                logger.info(f"👑 [MASTER-ENGINE-NODE] Proces {ENGINE_WORKER_ID} jest aktywnym MASTER.")
+                symbols = await master_bootstrap(GLOBAL_REDIS_BRIDGE, GLOBAL_OKX_CLIENT, session)
+                spawn_supervised_task(GLOBAL_WS_FEED.start_listener, "ws_price_feed", symbols, tg=GLOBAL_TG)
+                spawn_supervised_task(master_lock_heartbeat_worker, "master_heartbeat_worker", GLOBAL_REDIS_BRIDGE, tg=GLOBAL_TG)
+                spawn_supervised_task(protection_reconciler_worker, "reconciler_worker", GLOBAL_REDIS_BRIDGE, GLOBAL_TG, GLOBAL_OKX_CLIENT)
+                spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", session, GLOBAL_REDIS_BRIDGE, GLOBAL_TG, GLOBAL_OKX_CLIENT, GLOBAL_SMART_MONEY_ORACLE, tg=GLOBAL_TG)
+                if GLOBAL_TG:
+                    await GLOBAL_TG.push(f"👑 <b>[MASTER ENGINE ONLINE]</b> Silnik v18.0 (M15 CHoCH) wystartował pomyślnie. Kapitał bazowy zainicjalizowany.")
+            else:
+                IS_MASTER_ENGINE_NODE = False
+                logger.info(f"👀 [PASSIVE-NODE] Proces {ENGINE_WORKER_ID} działa w trybie PASSIVE.")
+                configured_symbols = [item["symbol"] for item in FUTURES_INSTRUMENTS]
+                spawn_supervised_task(GLOBAL_WS_FEED.start_listener, "ws_price_feed", configured_symbols, tg=GLOBAL_TG)
+                spawn_supervised_task(passive_leader_sentry_worker, "passive_sentry_worker", GLOBAL_REDIS_BRIDGE, GLOBAL_TG, GLOBAL_OKX_CLIENT, GLOBAL_SMART_MONEY_ORACLE, tg=GLOBAL_TG)
+
+            while not ASYNC_SHUTDOWN_EVENT.is_set():
+                await asyncio.sleep(1)
+
+            logger.info("🛑 [ASYNC-SHUTDOWN] Zatrzymywanie zadań w tle...")
+            if IS_MASTER_ENGINE_NODE:
+                await GLOBAL_REDIS_BRIDGE.release_master_engine_lock(ENGINE_WORKER_ID)
+            for t in list(BACKGROUND_TASKS):
+                t.cancel()
+            await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
+            logger.info("✅ [ASYNC-SHUTDOWN-COMPLETE] Wszystkie zadania asynchroniczne zostały zatrzymane.")
+
+    BACKGROUND_LOOP.run_until_complete(_runner())
+    SHUTDOWN_COMPLETE.set()
 
 def start_background_loop():
-    global BACKGROUND_LOOP
-    loop = asyncio.new_event_loop()
-    BACKGROUND_LOOP = loop
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(continuous_async_cron(loop))
-    except Exception as e:
-        logger.critical(f"💥 [FATAL-CRASH] Pętla bota padła: {e}")
-        os._exit(1)
-    finally:
-        try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        finally:
-            loop.close()
-            SHUTDOWN_COMPLETE.set()
+    t = threading.Thread(target=background_async_loop, daemon=True, name="FuturesAsyncLoop")
+    t.start()
 
-bg_thread = threading.Thread(target=start_background_loop, daemon=True, name="FuturesEngineThread")
-bg_thread.start()
+def graceful_shutdown_handler(signum, frame):
+    logger.warning(f"🛑 [SHUTDOWN-SIGNAL] Odebrano sygnał {signum}. Rozpoczynanie czystego zamykania...")
+    PROCESS_DRAINING.set()
+    if BACKGROUND_LOOP and ASYNC_SHUTDOWN_EVENT:
+        BACKGROUND_LOOP.call_soon_threadsafe(ASYNC_SHUTDOWN_EVENT.set)
 
-if __name__ == '__main__':
+signal.signal(signal.SIGTERM, graceful_shutdown_handler)
+signal.signal(signal.SIGINT, graceful_shutdown_handler)
+
+start_background_loop()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    logger.info(f"🚀 [FLASK-START] Uruchamianie serwera na porcie {port}...")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
