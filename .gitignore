@@ -1,0 +1,18 @@
+# Środowisko i konfiguracja prywatna
+.env
+.venv/
+venv/
+ENV/
+
+# Pamięć podręczna Pythona
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Narzędzia i edytory
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

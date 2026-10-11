@@ -1288,12 +1288,18 @@ class OKXFuturesClient:
                 data = await resp.json()
                 if data.get("code") == "0" and data.get("data"):
                     clean_target = family_or_symbol.split('-')[0].upper()
+                    matching = []
                     for item in data["data"]:
                         inst_id = item.get("instId", "")
                         state = item.get("state", "")
-                        if state == "live" and clean_target in inst_id.upper() and "XPERP" in inst_id.upper():
-                            logger.info(f"🎯 [AUTO-DISCOVERY] Dopasowano symbol Live: {inst_id}")
-                            return inst_id
+                        if state == "live" and (inst_id.upper().startswith(f"{clean_target}-") or inst_id.upper().startswith(f"{clean_target}_")) and "XPERP" in inst_id.upper():
+                            exp_time = int(item.get("expTime", 0) or 0)
+                            matching.append((exp_time, inst_id))
+                    if matching:
+                        matching.sort(key=lambda x: x[0], reverse=True)
+                        best_inst_id = matching[0][1]
+                        logger.info(f"🎯 [AUTO-DISCOVERY] Dopasowano symbol Live (najdalszy expTime): {best_inst_id}")
+                        return best_inst_id
         except Exception as e:
             logger.warning(f"⚠️ [AUTO-DISCOVERY-FALLBACK] {e}")
         return family_or_symbol
@@ -2059,13 +2065,16 @@ async def reconcile_and_timestop_futures(
 
             if should_trigger_be and new_sl_px > 0.0:
                 amend_res = await inst["client"].amend_algo_order(inst["symbol"], algo_id, new_sl_trigger_px=str(new_sl_px))
-                if amend_res and amend_res.get("code") == "0":
+                ok, err_msg, _ = validate_okx_response(amend_res)
+                if ok:
                     pos_data["beActivated"] = True
                     if "protection" in pos_data:
                         pos_data["protection"]["slPx"] = new_sl_px
                     pos_data["sl_price"] = new_sl_px
                     await redis_trade.set_position_state(pos_key, pos_data)
                     await tg.push(f"🛡️ <b>[DYNAMIC BREAK-EVEN: {inst['label']}]</b> SL przesunięty na <code>{new_sl_px} {QUOTE_CCY}</code>")
+                else:
+                    logger.error(f"❌ [AMEND-BE-FAILED] {inst['label']}: Błąd przestawiania SL na Break-Even ({err_msg})")
 
     if (time.time() - opened_at) > max_timeout:
         logger.warning(f"⏳ [TIME-STOP] Pozycja {inst['label']} [{pos_side}] przekroczyła {round(max_timeout/3600, 1)}h (48h limit). Zamykanie...")
