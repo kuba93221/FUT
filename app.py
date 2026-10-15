@@ -98,7 +98,7 @@ class TokenBucketRateLimiter:
         if wait_time > 0.0:
             await asyncio.sleep(wait_time)
 
-logger.info(f"⚙️ [SYSTEM-INIT] Silnik Futures 3x v18.0 PROD (M15 CHoCH Baseline) Online [QUOTE: {QUOTE_CCY} | PREFIKS: {REDIS_PREFIX} | SANDBOX: {IS_SANDBOX}]")
+logger.info(f"⚙️ [SYSTEM-INIT] Silnik Futures 3x v18.1 PROD (M15 CHoCH Hybrid TP) Online [QUOTE: {QUOTE_CCY} | PREFIKS: {REDIS_PREFIX} | SANDBOX: {IS_SANDBOX}]")
 
 BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
 GLOBAL_ALPHA_LOCK: Optional[asyncio.Lock] = None
@@ -165,7 +165,7 @@ CONFIG = {
     "ALPHA_MAX_ACTIVE_SLOTS": 3,
     "MIN_ORDER_VALUE_QUOTE": 11.0,
     "RESERVE_CASH_BUFFER_QUOTE": 3.0,
-    "RISK_PER_TRADE_PCT": 0.004,
+    "RISK_PER_TRADE_PCT": 0.010,  # ZMIANA v18.1: Podniesienie ryzyka z 0.004 (0.4%) na 0.010 (1.0%)
     "MAX_POSITION_PORTFOLIO_RATIO": 0.15,
     "MAX_ENTRY_SLIPPAGE_PCT": 0.0030,
     "HARD_RISK_CAP_ON_SLIPPAGE_PCT": 0.0050,
@@ -176,7 +176,8 @@ CONFIG = {
         "VOLATILITY_CUSHION_PCT": 0.0015,
         "BREAK_EVEN_TRIGGER_RATIO": 0.80,
         "BREAK_EVEN_FEE_BUFFER_PCT": 0.0010,
-        "RR_RATIO": 1.8
+        "MIN_RR_RATIO": 2.0,        # ZMIANA v18.1: Podłoga Risk/Reward (min. 2.0R)
+        "MAX_RR_RATIO": 3.5         # ZMIANA v18.1: Klamra Risk/Reward (max. 3.5R)
     },
     "TIMEOUTS": {
         "M15_CHOCH": 48 * 3600,
@@ -328,7 +329,8 @@ def find_structural_h1_swing_sl(
     cushion_pct: float = 0.0015,
     min_sl_pct: float = 0.012,
     max_sl_pct: float = 0.035,
-    rr_ratio: float = 1.8
+    min_rr: float = 2.0,
+    max_rr: float = 3.5
 ) -> Tuple[float, float, float]:
     lows = [float(c[3]) for c in candles_1h]
     highs = [float(c[2]) for c in candles_1h]
@@ -337,12 +339,16 @@ def find_structural_h1_swing_sl(
     if curr_h1_idx < 3 or entry_price <= 0:
         def_sl = 0.018
         p_sl = entry_price * (1.0 - def_sl) if pos_side == "long" else entry_price * (1.0 + def_sl)
-        p_tp = entry_price * (1.0 + def_sl * rr_ratio) if pos_side == "long" else entry_price * (1.0 - def_sl * rr_ratio)
+        p_tp = entry_price * (1.0 + def_sl * min_rr) if pos_side == "long" else entry_price * (1.0 - def_sl * min_rr)
         return round_price_to_tick(p_sl, tick_sz, "DOWN"), round_price_to_tick(p_tp, tick_sz, "UP"), def_sl
 
     found_level: Optional[float] = None
     start_idx = curr_h1_idx - 1
     end_idx = max(1, curr_h1_idx - lookback_bars)
+
+    # Odcięcie OSTATNIEJ świecy (świecy wejścia/wybicia), aby skanować wyłącznie HISTORYCZNĄ strukturę 72h przed ruchem
+    hist_candles_1h = candles_1h[:-1] if len(candles_1h) > 1 else candles_1h
+    lookback_72h = hist_candles_1h[-72:] if len(hist_candles_1h) >= 72 else hist_candles_1h
 
     if pos_side == "long":
         for i in range(start_idx, end_idx - 1, -1):
@@ -369,7 +375,19 @@ def find_structural_h1_swing_sl(
 
         price_sl = round_price_to_tick(entry_price * (1.0 - clamped_sl_pct), tick_sz, "DOWN")
         eff_sl_pct = max(min_sl_pct, abs(entry_price - price_sl) / entry_price if entry_price > 0 else min_sl_pct)
-        price_tp = round_price_to_tick(entry_price * (1.0 + eff_sl_pct * rr_ratio), tick_sz, "UP")
+        sl_dist = abs(entry_price - price_sl)
+
+        # Wyliczenie hybrydowego TP z naprawioną logiką wybicia (odcięcie świecy bieżącej + Uncharted Breakout handling)
+        structural_high = max(float(c[2]) for c in lookback_72h) if lookback_72h else (entry_price * 1.02)
+        if structural_high > entry_price:
+            raw_dist = structural_high - entry_price
+            raw_rr = raw_dist / sl_dist if sl_dist > 0 else min_rr
+            eff_rr = max(min_rr, min(raw_rr, max_rr))
+        else:
+            # W przypadku czystego wybicia ATH 72h (entry >= structural_high), targetujemy pełną klamrę max_rr (3.5R)
+            eff_rr = max_rr
+
+        price_tp = round_price_to_tick(entry_price + (sl_dist * eff_rr), tick_sz, "UP")
 
     else:
         for i in range(start_idx, end_idx - 1, -1):
@@ -396,7 +414,19 @@ def find_structural_h1_swing_sl(
 
         price_sl = round_price_to_tick(entry_price * (1.0 + clamped_sl_pct), tick_sz, "UP")
         eff_sl_pct = max(min_sl_pct, abs(price_sl - entry_price) / entry_price if entry_price > 0 else min_sl_pct)
-        price_tp = round_price_to_tick(entry_price * (1.0 - eff_sl_pct * rr_ratio), tick_sz, "DOWN")
+        sl_dist = abs(price_sl - entry_price)
+
+        # Wyliczenie hybrydowego TP z naprawioną logiką wybicia (odcięcie świecy bieżącej + Uncharted Breakdown handling)
+        structural_low = min(float(c[3]) for c in lookback_72h) if lookback_72h else (entry_price * 0.98)
+        if entry_price > structural_low:
+            raw_dist = entry_price - structural_low
+            raw_rr = raw_dist / sl_dist if sl_dist > 0 else min_rr
+            eff_rr = max(min_rr, min(raw_rr, max_rr))
+        else:
+            # W przypadku czystego wybicia dołka 72h (entry <= structural_low), targetujemy pełną klamrę max_rr (3.5R)
+            eff_rr = max_rr
+
+        price_tp = round_price_to_tick(entry_price - (sl_dist * eff_rr), tick_sz, "DOWN")
 
     return price_sl, price_tp, eff_sl_pct
 
@@ -445,7 +475,7 @@ def health_check():
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running() or PROCESS_DRAINING.is_set():
         return "FUTURES_ENGINE_DRAINING", 503
     role = "MASTER" if IS_MASTER_ENGINE_NODE else "PASSIVE"
-    return f"FUTURES_ENGINE_ONLINE_v18_CHOCH_{QUOTE_CCY} [{role}]", 200
+    return f"FUTURES_ENGINE_ONLINE_v18_1_HYBRID_TP_{QUOTE_CCY} [{role}]", 200
 
 @app.route('/status', methods=['GET'])
 def engine_status_endpoint():
@@ -479,7 +509,7 @@ def engine_status_endpoint():
 
         return {
             "status": "ONLINE",
-            "version": "v18.0_M15_CHOCH_PROD",
+            "version": "v18.1_M15_CHOCH_HYBRID_PROD",
             "engine_role": "MASTER" if IS_MASTER_ENGINE_NODE else "PASSIVE",
             "quote_currency": QUOTE_CCY,
             "target_leverage": TARGET_LEVERAGE,
@@ -2120,7 +2150,7 @@ async def protection_reconciler_worker(redis_trade, tg, okx_client):
             await interruptible_sleep(15)
 
 async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, smart_money_oracle):
-    logger.info("🎯 [M15 CHOCH SNIPER] Silnik Strategiczny v18.0 (CHoCH + H1 Swing Low) Online.")
+    logger.info("🎯 [M15 CHOCH SNIPER] Silnik Strategiczny v18.1 (CHoCH + Hybrid H1/H4 TP) Online.")
     scan_counter = 0
 
     while not (ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set()):
@@ -2334,7 +2364,8 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         cushion_pct=cushion_val,
                         min_sl_pct=0.012,
                         max_sl_pct=0.035,
-                        rr_ratio=1.8
+                        min_rr=CONFIG["DYNAMIC_RISK"].get("MIN_RR_RATIO", 2.0),
+                        max_rr=CONFIG["DYNAMIC_RISK"].get("MAX_RR_RATIO", 3.5)
                     )
 
                     risk_capital = available_cash * CONFIG["RISK_PER_TRADE_PCT"]
@@ -2445,7 +2476,8 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                                 cushion_pct=cushion_val,
                                 min_sl_pct=0.012,
                                 max_sl_pct=0.035,
-                                rr_ratio=1.8
+                                min_rr=CONFIG["DYNAMIC_RISK"].get("MIN_RR_RATIO", 2.0),
+                                max_rr=CONFIG["DYNAMIC_RISK"].get("MAX_RR_RATIO", 3.5)
                             )
 
                     prot_state, real_algo_id = await okx_client.ensure_position_protection(
@@ -2506,7 +2538,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         f"Taktyka: <b>{strategy_name}</b> [{pos_side.upper()} 3x Izolowany]\n"
                         f"Kurs: <b>{real_fill_px} {QUOTE_CCY}</b> | Margines: ~{actual_pos_margin} {QUOTE_CCY}\n"
                         f"Kontrakty: <b>{format_sz(real_size)} sz</b>\n"
-                        f"🎯 TP (1.8R): <code>{price_tp}</code> | 🛑 SL (H1 Swing): <code>{price_sl}</code>\n"
+                        f"🎯 TP (Hybrid H1/H4): <code>{price_tp}</code> | 🛑 SL (H1 Swing): <code>{price_sl}</code>\n"
                         f"🛡️ <b>Stan: PROTECTED (OKX OCO Algo ID: {real_algo_id})</b>\n"
                         f"🐳 Smart Money: <code>{sm_note}</code>"
                     )
@@ -2603,7 +2635,7 @@ async def master_bootstrap(redis_trade, okx_client, session):
                             else:
                                 logger.critical(f"🚨 [NAKED-REHYDRATION] Pozycja {pos_inst}:{pos_side} bez OCO! Uzbrajanie...")
                                 p_sl = round_price_to_tick(avg_px * (1.0 - 0.018), tick_sz, "DOWN") if pos_side == "long" else round_price_to_tick(avg_px * (1.0 + 0.018), tick_sz, "UP")
-                                p_tp = round_price_to_tick(avg_px * (1.0 + 0.018 * 1.8), tick_sz, "UP") if pos_side == "long" else round_price_to_tick(avg_px * (1.0 - 0.018 * 1.8), tick_sz, "DOWN")
+                                p_tp = round_price_to_tick(avg_px * (1.0 + 0.018 * 2.0), tick_sz, "UP") if pos_side == "long" else round_price_to_tick(avg_px * (1.0 - 0.018 * 2.0), tick_sz, "DOWN")
                                 oco_res = await okx_client.execute_futures_oco(pos_inst, pos_side, pos_sz, p_tp, p_sl, tick_sz=tick_sz)
                                 if oco_res and oco_res.get("code") == "0" and oco_res.get("data"):
                                     detected_algo_id = oco_res["data"][0].get("algoId")
@@ -2753,7 +2785,7 @@ def background_async_loop():
                 spawn_supervised_task(protection_reconciler_worker, "reconciler_worker", GLOBAL_REDIS_BRIDGE, GLOBAL_TG, GLOBAL_OKX_CLIENT)
                 spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", session, GLOBAL_REDIS_BRIDGE, GLOBAL_TG, GLOBAL_OKX_CLIENT, GLOBAL_SMART_MONEY_ORACLE, tg=GLOBAL_TG)
                 if GLOBAL_TG:
-                    await GLOBAL_TG.push(f"👑 <b>[MASTER ENGINE ONLINE]</b> Silnik v18.0 (M15 CHoCH) wystartował pomyślnie. Kapitał bazowy zainicjalizowany.")
+                    await GLOBAL_TG.push(f"👑 <b>[MASTER ENGINE ONLINE]</b> Silnik v18.1 (M15 CHoCH Hybrid TP) wystartował pomyślnie. Kapitał bazowy zainicjalizowany.")
             else:
                 IS_MASTER_ENGINE_NODE = False
                 logger.info(f"👀 [PASSIVE-NODE] Proces {ENGINE_WORKER_ID} działa w trybie PASSIVE.")
