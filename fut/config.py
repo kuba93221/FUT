@@ -140,4 +140,15 @@ CONFIG = {
 }
 
 
+# Bezpiecznik reżimu (regime filter): trend BTC na daily EMA50 vs EMA200 (crossover).
+# LONG tylko gdy EMA50 > EMA200; SHORT tylko gdy EMA50 < EMA200.
+REGIME_ENABLED = True
+REGIME_BTC_SYMBOL = "BTC-USDT-SWAP"   # benchmark (USDT perp = najdłuższa, stabilna historia)
+REGIME_BAR = "1D"
+REGIME_EMA_FAST = 50
+REGIME_EMA_PERIOD = 200
+REGIME_CANDLES_LIMIT = 250
+REGIME_CACHE_TTL_SEC = 3600.0
+
+
 logger.info(f"⚙️ [SYSTEM-INIT] Silnik Futures 3x {VERSION} PROD (M15 CHoCH Baseline) Online [QUOTE: {QUOTE_CCY} | PREFIKS: {REDIS_PREFIX} | SANDBOX: {IS_SANDBOX}]")

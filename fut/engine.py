@@ -4,7 +4,11 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
-from .config import logger, CONFIG, QUOTE_CCY, TARGET_LEVERAGE, FUTURES_INSTRUMENTS, DEFAULT_EQUITY_FALLBACK
+from .config import (
+    logger, CONFIG, QUOTE_CCY, TARGET_LEVERAGE, FUTURES_INSTRUMENTS, DEFAULT_EQUITY_FALLBACK,
+    REGIME_ENABLED, REGIME_BTC_SYMBOL, REGIME_BAR, REGIME_EMA_FAST, REGIME_EMA_PERIOD,
+    REGIME_CANDLES_LIMIT, REGIME_CACHE_TTL_SEC,
+)
 from .utils import (
     get_canonical_pos_key, validate_okx_response, round_price_to_tick,
     format_px, format_sz, find_structural_h1_swing_sl, generate_cl_ord_id,
@@ -239,6 +243,21 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                 await interruptible_sleep(60)
                 continue
 
+            # Bezpiecznik reżimu: crossover EMA50>EMA200 na BTC daily
+            regime_bull = None  # None -> brak danych, handel obu stron (fail-safe)
+            if REGIME_ENABLED:
+                try:
+                    btc_daily = await okx_client.get_macro_candles_cached(
+                        REGIME_BTC_SYMBOL, bar=REGIME_BAR, limit=REGIME_CANDLES_LIMIT,
+                        cache_ttl_sec=REGIME_CACHE_TTL_SEC)
+                    if len(btc_daily) >= REGIME_EMA_PERIOD:
+                        closes = [float(c[4]) for c in btc_daily]
+                        ema_fast = calc_ema(closes, REGIME_EMA_FAST)
+                        ema_slow = calc_ema(closes, REGIME_EMA_PERIOD)
+                        regime_bull = ema_fast[-1] > ema_slow[-1]
+                except Exception as e:
+                    logger.error(f"⚠️ [REGIME] błąd pobierania BTC daily: {e}")
+
             candidates: List[Dict[str, Any]] = []
             scan_counter += 1
             is_verbose_cycle = (scan_counter % 4 == 0)
@@ -347,6 +366,12 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                     if m15_swing_low and c15m_close < m15_swing_low and c15m_close < c15m_open:
                         signal_short = True
                         rank_score = (m15_swing_low - c15m_close) / c15m_close
+
+                # Bezpiecznik reżimu: wycinanie sygnałów sprzecznych z trendem BTC (EMA50>EMA200)
+                if regime_bull is True:
+                    signal_short = False
+                elif regime_bull is False:
+                    signal_long = False
 
                 if signal_long or signal_short:
                     logger.info(f"🎯 [M15-CHOCH-SIGNAL] {conf['label']} wybił strukturę CHoCH! (Kierunek: {'LONG' if signal_long else 'SHORT'}, Wynik Rank: {round(rank_score*100, 3)}%)")
