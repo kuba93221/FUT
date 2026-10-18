@@ -159,7 +159,7 @@ class UpstashRedisFuturesBridge:
 
     async def is_system_paused_distributed(self) -> bool:
         if not self.url:
-            return state.GLOBAL_TRADING_PAUSED
+            return state.ctx.trading_paused
         safe_key = self._enforce_prefix("SYSTEM_STATE:TRADING_PAUSED")
         try:
             cmd = ["GET", safe_key]
@@ -172,7 +172,7 @@ class UpstashRedisFuturesBridge:
         except Exception:
             if not IS_SANDBOX:
                 return True
-        return state.GLOBAL_TRADING_PAUSED
+        return state.ctx.trading_paused
 
     async def set_circuit_breaker(self, active: bool) -> bool:
         if not self.url:

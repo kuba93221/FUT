@@ -163,10 +163,10 @@ def build_fixture():
 
 
 async def run_single_cycle(okx, redis, tg) -> Tuple[int, int, Optional[Dict[str, Any]]]:
-    state.IS_MASTER_ENGINE_NODE = True
-    state.ASYNC_SHUTDOWN_EVENT = asyncio.Event()
-    state.GLOBAL_ALPHA_LOCK = asyncio.Lock()
-    state.GLOBAL_TRADING_PAUSED = False
+    state.ctx.is_master = True
+    state.ctx.shutdown_event = asyncio.Event()
+    state.ctx.alpha_lock = asyncio.Lock()
+    state.ctx.trading_paused = False
 
     worker = asyncio.create_task(independent_4tf_sniper_worker(None, redis, tg, okx, None))
 
@@ -175,7 +175,7 @@ async def run_single_cycle(okx, redis, tg) -> Tuple[int, int, Optional[Dict[str,
     while not okx.placed_orders and time.monotonic() < deadline:
         await asyncio.sleep(0.2)
 
-    state.ASYNC_SHUTDOWN_EVENT.set()
+    state.ctx.shutdown_event.set()
     try:
         await asyncio.wait_for(worker, timeout=10.0)
     except asyncio.TimeoutError:

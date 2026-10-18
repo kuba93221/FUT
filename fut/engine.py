@@ -182,9 +182,9 @@ async def reconcile_and_timestop_futures(
 
 async def protection_reconciler_worker(redis_trade, tg, okx_client):
     logger.info("🛡️ [RECONCILER-WORKER] Dedykowana pętla monitorowania pozycji i ochrony OCO Online (interwał 15s).")
-    while not (state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set()):
+    while not (state.ctx.shutdown_event and state.ctx.shutdown_event.is_set()):
         try:
-            if state.IS_MASTER_ENGINE_NODE:
+            if state.ctx.is_master:
                 active_keys = await redis_trade.get_active_positions()
                 for k in active_keys:
                     pos_data = await redis_trade.get_position_state(k)
@@ -206,9 +206,9 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
     logger.info("🎯 [M15 CHOCH SNIPER] Silnik Strategiczny v18.0 (CHoCH + H1 Swing Low) Online.")
     scan_counter = 0
 
-    while not (state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set()):
+    while not (state.ctx.shutdown_event and state.ctx.shutdown_event.is_set()):
         try:
-            if not state.IS_MASTER_ENGINE_NODE:
+            if not state.ctx.is_master:
                 await interruptible_sleep(10)
                 continue
 
@@ -249,7 +249,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
             now_scan_ts = time.time()
 
             for conf in FUTURES_INSTRUMENTS:
-                if not state.IS_MASTER_ENGINE_NODE:
+                if not state.ctx.is_master:
                     break
 
                 sym = conf["symbol"]
@@ -360,7 +360,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
             candidates.sort(key=lambda x: x["rank_score"], reverse=True)
 
             for best_signal in candidates:
-                if not state.IS_MASTER_ENGINE_NODE:
+                if not state.ctx.is_master:
                     break
 
                 sym = best_signal["symbol"]
@@ -379,7 +379,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                     logger.warning(f"🐳 [SMART-MONEY] Odrzucono sygnał {conf['label']}: {sm_note}")
                     continue
 
-                async with state.GLOBAL_ALPHA_LOCK:
+                async with state.ctx.alpha_lock:
                     active_keys = await redis_trade.get_active_positions()
                     if len(active_keys) >= CONFIG["ALPHA_MAX_ACTIVE_SLOTS"] or any(base in ak for ak in active_keys):
                         continue
@@ -605,16 +605,16 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
 
 async def master_lock_heartbeat_worker(redis_trade):
     logger.info("👑 [MASTER-HEARTBEAT] Dedykowany heartbeat lidera uruchomiony.")
-    while not (state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set()):
+    while not (state.ctx.shutdown_event and state.ctx.shutdown_event.is_set()):
         await interruptible_sleep(15)
-        if state.IS_MASTER_ENGINE_NODE:
-            renewed = await redis_trade.renew_master_engine_lock(state.ENGINE_WORKER_ID, ttl_seconds=60)
+        if state.ctx.is_master:
+            renewed = await redis_trade.renew_master_engine_lock(state.ctx.worker_id, ttl_seconds=60)
             if not renewed:
                 logger.critical("🚨🚨🚨 [MASTER-LOCK-LOST] Utracono blokadę lidera! Przechodzenie w stan PASSIVE.")
-                state.IS_MASTER_ENGINE_NODE = False
-                if state.GLOBAL_TG:
-                    await state.GLOBAL_TG.push("🚨🚨🚨 <b>[SPLIT-BRAIN PREVENTED]</b> Utracono blokadę Master — przechodzenie w stan PASSIVE.")
-                spawn_supervised_task(passive_leader_sentry_worker, "passive_sentry_worker", state.GLOBAL_REDIS_BRIDGE, state.GLOBAL_TG, state.GLOBAL_OKX_CLIENT, state.GLOBAL_SMART_MONEY_ORACLE, tg=state.GLOBAL_TG)
+                state.ctx.is_master = False
+                if state.ctx.tg:
+                    await state.ctx.tg.push("🚨🚨🚨 <b>[SPLIT-BRAIN PREVENTED]</b> Utracono blokadę Master — przechodzenie w stan PASSIVE.")
+                spawn_supervised_task(passive_leader_sentry_worker, "passive_sentry_worker", state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client, state.ctx.smart_money_oracle, tg=state.ctx.tg)
                 break
 
 
@@ -731,19 +731,19 @@ async def master_bootstrap(redis_trade, okx_client, session):
 
 
 async def passive_leader_sentry_worker(redis_trade, tg, okx_client, smart_money_oracle):
-    if state.IS_MASTER_ENGINE_NODE:
+    if state.ctx.is_master:
         return
     logger.info("👀 [PASSIVE-SENTRY] Węzeł pasywny nasłuchuje wolnego miejsca lidera...")
-    while not (state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set()) and not state.IS_MASTER_ENGINE_NODE:
+    while not (state.ctx.shutdown_event and state.ctx.shutdown_event.is_set()) and not state.ctx.is_master:
         await interruptible_sleep(10)
-        if state.IS_MASTER_ENGINE_NODE or (state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set()):
+        if state.ctx.is_master or (state.ctx.shutdown_event and state.ctx.shutdown_event.is_set()):
             break
-        acquired = await redis_trade.acquire_master_engine_lock(state.ENGINE_WORKER_ID, ttl_seconds=60)
+        acquired = await redis_trade.acquire_master_engine_lock(state.ctx.worker_id, ttl_seconds=60)
         if acquired:
-            logger.info(f"👑 [LEADER-PROMOTION] Węzeł pasywny {state.ENGINE_WORKER_ID} przejął rolę aktywnego MASTER Engine!")
+            logger.info(f"👑 [LEADER-PROMOTION] Węzeł pasywny {state.ctx.worker_id} przejął rolę aktywnego MASTER Engine!")
             try:
                 await master_bootstrap(redis_trade, okx_client, okx_client.session)
-                state.IS_MASTER_ENGINE_NODE = True
+                state.ctx.is_master = True
                 spawn_supervised_task(master_lock_heartbeat_worker, "master_heartbeat_worker", redis_trade, tg=tg)
                 spawn_supervised_task(protection_reconciler_worker, "reconciler_worker", redis_trade, tg, okx_client)
                 spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", okx_client.session, redis_trade, tg, okx_client, smart_money_oracle, tg=tg)
@@ -752,19 +752,19 @@ async def passive_leader_sentry_worker(redis_trade, tg, okx_client, smart_money_
                 break
             except Exception as e:
                 logger.error(f"❌ [PROMOTION-BOOTSTRAP-ERR] {e}")
-                state.IS_MASTER_ENGINE_NODE = False
+                state.ctx.is_master = False
 
 
 def spawn_supervised_task(coro_fn, name: str, *args, tg: Optional[TelegramThrottledDispatcher] = None) -> asyncio.Task:
     async def _supervisor_wrapper():
         restart_count = 0
-        while not (state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set()):
+        while not (state.ctx.shutdown_event and state.ctx.shutdown_event.is_set()):
             try:
                 logger.info(f"🛡️ [SUPERVISOR] Uruchamianie '{name}' (cykl #{restart_count})...")
                 await coro_fn(*args)
-                if state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set():
+                if state.ctx.shutdown_event and state.ctx.shutdown_event.is_set():
                     break
-                if name == "passive_sentry_worker" and state.IS_MASTER_ENGINE_NODE:
+                if name == "passive_sentry_worker" and state.ctx.is_master:
                     logger.info("🛡️ [SUPERVISOR] 'passive_sentry_worker' zakończył zadanie po pomyślnym awansie.")
                     break
                 logger.warning(f"⚠️ [SUPERVISOR] '{name}' zakończył działanie. Wznowienie za 3s...")
@@ -780,8 +780,8 @@ def spawn_supervised_task(coro_fn, name: str, *args, tg: Optional[TelegramThrott
                 await asyncio.sleep(5)
 
     task = asyncio.create_task(_supervisor_wrapper(), name=name)
-    state.BACKGROUND_TASKS.add(task)
-    task.add_done_callback(state.BACKGROUND_TASKS.discard)
+    state.ctx.background_tasks.add(task)
+    task.add_done_callback(state.ctx.background_tasks.discard)
     return task
 
 
@@ -790,7 +790,7 @@ async def interruptible_sleep(seconds: float):
         return
     end_time = time.monotonic() + seconds
     while time.monotonic() < end_time:
-        if state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set():
+        if state.ctx.shutdown_event and state.ctx.shutdown_event.is_set():
             break
         step = min(1.0, end_time - time.monotonic())
         if step > 0:
