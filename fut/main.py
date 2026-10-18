@@ -19,63 +19,63 @@ from . import state
 
 
 def background_async_loop():
-    state.BACKGROUND_LOOP = asyncio.new_event_loop()
-    asyncio.set_event_loop(state.BACKGROUND_LOOP)
+    state.ctx.background_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(state.ctx.background_loop)
 
-    state.GLOBAL_ALPHA_LOCK = asyncio.Lock()
-    state.ASYNC_SHUTDOWN_EVENT = asyncio.Event()
+    state.ctx.alpha_lock = asyncio.Lock()
+    state.ctx.shutdown_event = asyncio.Event()
 
-    state.RATE_LIMITER_PUBLIC = TokenBucketRateLimiter(tokens_per_second=5.0, max_capacity=10.0)
-    state.RATE_LIMITER_TRADE = TokenBucketRateLimiter(tokens_per_second=4.0, max_capacity=8.0)
-    state.RATE_LIMITER_ACCOUNT = TokenBucketRateLimiter(tokens_per_second=4.0, max_capacity=8.0)
+    state.ctx.rate_limiter_public = TokenBucketRateLimiter(tokens_per_second=5.0, max_capacity=10.0)
+    state.ctx.rate_limiter_trade = TokenBucketRateLimiter(tokens_per_second=4.0, max_capacity=8.0)
+    state.ctx.rate_limiter_account = TokenBucketRateLimiter(tokens_per_second=4.0, max_capacity=8.0)
 
     async def _runner():
         async with aiohttp.ClientSession() as session:
             tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
             tg_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-            state.GLOBAL_TG = TelegramThrottledDispatcher(tg_token, tg_chat, session)
+            state.ctx.tg = TelegramThrottledDispatcher(tg_token, tg_chat, session)
 
             upstash_url = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
             upstash_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
-            state.GLOBAL_REDIS_BRIDGE = UpstashRedisFuturesBridge(upstash_url, upstash_token, session)
+            state.ctx.redis_bridge = UpstashRedisFuturesBridge(upstash_url, upstash_token, session)
 
-            state.GLOBAL_OKX_CLIENT = OKXFuturesClient(session, state.RATE_LIMITER_TRADE, state.RATE_LIMITER_PUBLIC, state.RATE_LIMITER_ACCOUNT, is_sandbox=IS_SANDBOX)
-            state.GLOBAL_SMART_MONEY_ORACLE = OKXSmartMoneyOracle(session, state.RATE_LIMITER_PUBLIC, is_sandbox=IS_SANDBOX)
-            state.GLOBAL_WS_FEED = OKXWebSocketPriceFeed(session, is_sandbox=IS_SANDBOX)
+            state.ctx.okx_client = OKXFuturesClient(session, state.ctx.rate_limiter_trade, state.ctx.rate_limiter_public, state.ctx.rate_limiter_account, is_sandbox=IS_SANDBOX)
+            state.ctx.smart_money_oracle = OKXSmartMoneyOracle(session, state.ctx.rate_limiter_public, is_sandbox=IS_SANDBOX)
+            state.ctx.ws_feed = OKXWebSocketPriceFeed(session, is_sandbox=IS_SANDBOX)
 
             logger.info("🌐 [STARTUP] Próba przejęcia roli MASTER...")
-            acquired = await state.GLOBAL_REDIS_BRIDGE.acquire_master_engine_lock(state.ENGINE_WORKER_ID, ttl_seconds=60)
+            acquired = await state.ctx.redis_bridge.acquire_master_engine_lock(state.ctx.worker_id, ttl_seconds=60)
 
             if acquired:
-                state.IS_MASTER_ENGINE_NODE = True
-                logger.info(f"👑 [MASTER-ENGINE-NODE] Proces {state.ENGINE_WORKER_ID} jest aktywnym MASTER.")
-                symbols = await master_bootstrap(state.GLOBAL_REDIS_BRIDGE, state.GLOBAL_OKX_CLIENT, session)
-                spawn_supervised_task(state.GLOBAL_WS_FEED.start_listener, "ws_price_feed", symbols, tg=state.GLOBAL_TG)
-                spawn_supervised_task(master_lock_heartbeat_worker, "master_heartbeat_worker", state.GLOBAL_REDIS_BRIDGE, tg=state.GLOBAL_TG)
-                spawn_supervised_task(protection_reconciler_worker, "reconciler_worker", state.GLOBAL_REDIS_BRIDGE, state.GLOBAL_TG, state.GLOBAL_OKX_CLIENT)
-                spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", session, state.GLOBAL_REDIS_BRIDGE, state.GLOBAL_TG, state.GLOBAL_OKX_CLIENT, state.GLOBAL_SMART_MONEY_ORACLE, tg=state.GLOBAL_TG)
-                if state.GLOBAL_TG:
-                    await state.GLOBAL_TG.push("👑 <b>[MASTER ENGINE ONLINE]</b> Silnik v18.0 (M15 CHoCH) wystartował pomyślnie. Kapitał bazowy zainicjalizowany.")
+                state.ctx.is_master = True
+                logger.info(f"👑 [MASTER-ENGINE-NODE] Proces {state.ctx.worker_id} jest aktywnym MASTER.")
+                symbols = await master_bootstrap(state.ctx.redis_bridge, state.ctx.okx_client, session)
+                spawn_supervised_task(state.ctx.ws_feed.start_listener, "ws_price_feed", symbols, tg=state.ctx.tg)
+                spawn_supervised_task(master_lock_heartbeat_worker, "master_heartbeat_worker", state.ctx.redis_bridge, tg=state.ctx.tg)
+                spawn_supervised_task(protection_reconciler_worker, "reconciler_worker", state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client)
+                spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", session, state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client, state.ctx.smart_money_oracle, tg=state.ctx.tg)
+                if state.ctx.tg:
+                    await state.ctx.tg.push("👑 <b>[MASTER ENGINE ONLINE]</b> Silnik v18.0 (M15 CHoCH) wystartował pomyślnie. Kapitał bazowy zainicjalizowany.")
             else:
-                state.IS_MASTER_ENGINE_NODE = False
-                logger.info(f"👀 [PASSIVE-NODE] Proces {state.ENGINE_WORKER_ID} działa w trybie PASSIVE.")
+                state.ctx.is_master = False
+                logger.info(f"👀 [PASSIVE-NODE] Proces {state.ctx.worker_id} działa w trybie PASSIVE.")
                 configured_symbols = [item["symbol"] for item in FUTURES_INSTRUMENTS]
-                spawn_supervised_task(state.GLOBAL_WS_FEED.start_listener, "ws_price_feed", configured_symbols, tg=state.GLOBAL_TG)
-                spawn_supervised_task(passive_leader_sentry_worker, "passive_sentry_worker", state.GLOBAL_REDIS_BRIDGE, state.GLOBAL_TG, state.GLOBAL_OKX_CLIENT, state.GLOBAL_SMART_MONEY_ORACLE, tg=state.GLOBAL_TG)
+                spawn_supervised_task(state.ctx.ws_feed.start_listener, "ws_price_feed", configured_symbols, tg=state.ctx.tg)
+                spawn_supervised_task(passive_leader_sentry_worker, "passive_sentry_worker", state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client, state.ctx.smart_money_oracle, tg=state.ctx.tg)
 
-            while not state.ASYNC_SHUTDOWN_EVENT.is_set():
+            while not state.ctx.shutdown_event.is_set():
                 await asyncio.sleep(1)
 
             logger.info("🛑 [ASYNC-SHUTDOWN] Zatrzymywanie zadań w tle...")
-            if state.IS_MASTER_ENGINE_NODE:
-                await state.GLOBAL_REDIS_BRIDGE.release_master_engine_lock(state.ENGINE_WORKER_ID)
-            for t in list(state.BACKGROUND_TASKS):
+            if state.ctx.is_master:
+                await state.ctx.redis_bridge.release_master_engine_lock(state.ctx.worker_id)
+            for t in list(state.ctx.background_tasks):
                 t.cancel()
-            await asyncio.gather(*state.BACKGROUND_TASKS, return_exceptions=True)
+            await asyncio.gather(*state.ctx.background_tasks, return_exceptions=True)
             logger.info("✅ [ASYNC-SHUTDOWN-COMPLETE] Wszystkie zadania asynchroniczne zostały zatrzymane.")
 
-    state.BACKGROUND_LOOP.run_until_complete(_runner())
-    state.SHUTDOWN_COMPLETE.set()
+    state.ctx.background_loop.run_until_complete(_runner())
+    state.ctx.shutdown_complete.set()
 
 
 def start_background_loop():
@@ -85,9 +85,9 @@ def start_background_loop():
 
 def graceful_shutdown_handler(signum, frame):
     logger.warning(f"🛑 [SHUTDOWN-SIGNAL] Odebrano sygnał {signum}. Rozpoczynanie czystego zamykania...")
-    state.PROCESS_DRAINING.set()
-    if state.BACKGROUND_LOOP and state.ASYNC_SHUTDOWN_EVENT:
-        state.BACKGROUND_LOOP.call_soon_threadsafe(state.ASYNC_SHUTDOWN_EVENT.set)
+    state.ctx.process_draining.set()
+    if state.ctx.background_loop and state.ctx.shutdown_event:
+        state.ctx.background_loop.call_soon_threadsafe(state.ctx.shutdown_event.set)
 
 
 signal.signal(signal.SIGTERM, graceful_shutdown_handler)

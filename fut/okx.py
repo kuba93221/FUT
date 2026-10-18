@@ -125,7 +125,7 @@ class OKXWebSocketPriceFeed:
 
     async def _ping_worker(self, ws):
         try:
-            while not ws.closed and self._running and not (state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set()):
+            while not ws.closed and self._running and not (state.ctx.shutdown_event and state.ctx.shutdown_event.is_set()):
                 await asyncio.sleep(20)
                 if not ws.closed:
                     await ws.send_str("ping")
@@ -137,7 +137,7 @@ class OKXWebSocketPriceFeed:
         sub_args = [{"channel": "tickers", "instId": sym} for sym in symbols]
         subscribe_msg = json.dumps({"op": "subscribe", "args": sub_args})
 
-        while self._running and not (state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set()):
+        while self._running and not (state.ctx.shutdown_event and state.ctx.shutdown_event.is_set()):
             ws_url = self.ws_endpoints[self.current_ep_index % len(self.ws_endpoints)]
             try:
                 logger.info(f"🌐 [WS-CONNECT] Łączenie z OKX SWAP EEA: {ws_url}...")
@@ -148,7 +148,7 @@ class OKXWebSocketPriceFeed:
                     ping_task = asyncio.create_task(self._ping_worker(ws))
 
                     try:
-                        while self._running and not (state.ASYNC_SHUTDOWN_EVENT and state.ASYNC_SHUTDOWN_EVENT.is_set()):
+                        while self._running and not (state.ctx.shutdown_event and state.ctx.shutdown_event.is_set()):
                             try:
                                 msg = await asyncio.wait_for(ws.receive(), timeout=45.0)
                             except asyncio.TimeoutError:
@@ -416,8 +416,8 @@ class OKXFuturesClient:
         return contracts, round(actual_margin, 2)
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
-        if state.GLOBAL_WS_FEED:
-            ws_price = state.GLOBAL_WS_FEED.get_last_price(symbol)
+        if state.ctx.ws_feed:
+            ws_price = state.ctx.ws_feed.get_last_price(symbol)
             if ws_price and ws_price > 0.0:
                 return {"source": "OKX_WS", "symbol": symbol, "last": ws_price}
         await self.limiter_public.consume()

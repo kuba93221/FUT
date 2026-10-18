@@ -8,26 +8,42 @@ import os
 import time
 import asyncio
 import threading
+from dataclasses import dataclass, field
 from typing import Any, Optional, Set
 
-BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
-GLOBAL_ALPHA_LOCK: Optional[asyncio.Lock] = None
-ASYNC_SHUTDOWN_EVENT: Optional[asyncio.Event] = None
-BACKGROUND_TASKS: Set[asyncio.Task] = set()
 
-RATE_LIMITER_PUBLIC: Optional[Any] = None
-RATE_LIMITER_TRADE: Optional[Any] = None
-RATE_LIMITER_ACCOUNT: Optional[Any] = None
+@dataclass
+class EngineContext:
+    """Kontekst runtime'u silnika Futures 3x (zastępuje dawne globalne state.*)."""
 
-GLOBAL_WS_FEED: Optional[Any] = None
-GLOBAL_OKX_CLIENT: Optional[Any] = None
-GLOBAL_REDIS_BRIDGE: Optional[Any] = None
-GLOBAL_TG: Optional[Any] = None
-GLOBAL_SMART_MONEY_ORACLE: Optional[Any] = None
+    # ---- pętla i synchronizacja asyncio ----
+    background_loop: Optional[asyncio.AbstractEventLoop] = None
+    alpha_lock: Optional[asyncio.Lock] = None
+    shutdown_event: Optional[asyncio.Event] = None
+    background_tasks: Set[asyncio.Task] = field(default_factory=set)
 
-IS_MASTER_ENGINE_NODE: bool = False
-ENGINE_WORKER_ID: str = f"WORKER_{os.getpid()}_{int(time.time())}"
+    # ---- limitery (TokenBucketRateLimiter) ----
+    rate_limiter_public: Optional[Any] = None
+    rate_limiter_trade: Optional[Any] = None
+    rate_limiter_account: Optional[Any] = None
 
-SHUTDOWN_COMPLETE = threading.Event()
-PROCESS_DRAINING = threading.Event()
-GLOBAL_TRADING_PAUSED: bool = False
+    # ---- usługi (klienci / most / feed / orka) ----
+    ws_feed: Optional[Any] = None
+    okx_client: Optional[Any] = None
+    redis_bridge: Optional[Any] = None
+    tg: Optional[Any] = None
+    smart_money_oracle: Optional[Any] = None
+
+    # ---- flagi i identyfikatory ----
+    is_master: bool = False
+    worker_id: str = field(default_factory=lambda: f"WORKER_{os.getpid()}_{int(time.time())}")
+
+    # ---- zdarzenia synchronizacyjne (wątki) ----
+    shutdown_complete: threading.Event = field(default_factory=threading.Event)
+    process_draining: threading.Event = field(default_factory=threading.Event)
+
+    # ---- sterowanie handlem ----
+    trading_paused: bool = False
+
+
+ctx: EngineContext = EngineContext()

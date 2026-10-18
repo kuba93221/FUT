@@ -2,7 +2,7 @@
 
 Moduły:
 - config: konfiguracja, logger, instrumenty, CONFIG
-- state: współdzielony globalny stan silnika
+- state: typowany kontekst runtime'u silnika (EngineContext, singleton state.ctx)
 - utils: funkcje czyste (zaokrąglenia, wskaźniki, walidacja)
 - rate_limiter: TokenBucketRateLimiter
 - telegram: TelegramThrottledDispatcher
