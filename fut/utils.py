@@ -145,7 +145,7 @@ def find_structural_h1_swing_sl(
     cushion_pct: float = 0.0015,
     min_sl_pct: float = 0.012,
     max_sl_pct: float = 0.035,
-    rr_ratio: float = 1.8
+    rr_ratio: float = 2.0
 ) -> Tuple[float, float, float]:
     lows = [float(c[3]) for c in candles_1h]
     highs = [float(c[2]) for c in candles_1h]
