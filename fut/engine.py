@@ -417,7 +417,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         cushion_pct=cushion_val,
                         min_sl_pct=0.012,
                         max_sl_pct=0.035,
-                        rr_ratio=1.8
+                        rr_ratio=2.0
                     )
 
                     risk_capital = available_cash * CONFIG["RISK_PER_TRADE_PCT"]
@@ -528,7 +528,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                                 cushion_pct=cushion_val,
                                 min_sl_pct=0.012,
                                 max_sl_pct=0.035,
-                                rr_ratio=1.8
+                                rr_ratio=2.0
                             )
 
                     prot_state, real_algo_id = await okx_client.ensure_position_protection(
@@ -589,7 +589,7 @@ async def independent_4tf_sniper_worker(session, redis_trade, tg, okx_client, sm
                         f"Taktyka: <b>{strategy_name}</b> [{pos_side.upper()} 3x Izolowany]\n"
                         f"Kurs: <b>{real_fill_px} {QUOTE_CCY}</b> | Margines: ~{actual_pos_margin} {QUOTE_CCY}\n"
                         f"Kontrakty: <b>{format_sz(real_size)} sz</b>\n"
-                        f"🎯 TP (1.8R): <code>{price_tp}</code> | 🛑 SL (H1 Swing): <code>{price_sl}</code>\n"
+                        f"🎯 TP (2.0R): <code>{price_tp}</code> | 🛑 SL (H1 Swing): <code>{price_sl}</code>\n"
                         f"🛡️ <b>Stan: PROTECTED (OKX OCO Algo ID: {real_algo_id})</b>\n"
                         f"🐳 Smart Money: <code>{sm_note}</code>"
                     )
@@ -687,7 +687,7 @@ async def master_bootstrap(redis_trade, okx_client, session):
                             else:
                                 logger.critical(f"🚨 [NAKED-REHYDRATION] Pozycja {pos_inst}:{pos_side} bez OCO! Uzbrajanie...")
                                 p_sl = round_price_to_tick(avg_px * (1.0 - 0.018), tick_sz, "DOWN") if pos_side == "long" else round_price_to_tick(avg_px * (1.0 + 0.018), tick_sz, "UP")
-                                p_tp = round_price_to_tick(avg_px * (1.0 + 0.018 * 1.8), tick_sz, "UP") if pos_side == "long" else round_price_to_tick(avg_px * (1.0 - 0.018 * 1.8), tick_sz, "DOWN")
+                                p_tp = round_price_to_tick(avg_px * (1.0 + 0.018 * 2.0), tick_sz, "UP") if pos_side == "long" else round_price_to_tick(avg_px * (1.0 - 0.018 * 2.0), tick_sz, "DOWN")
                                 oco_res = await okx_client.execute_futures_oco(pos_inst, pos_side, pos_sz, p_tp, p_sl, tick_sz=tick_sz)
                                 if oco_res and oco_res.get("code") == "0" and oco_res.get("data"):
                                     detected_algo_id = oco_res["data"][0].get("algoId")
