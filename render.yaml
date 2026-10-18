@@ -1,0 +1,41 @@
+# Render Blueprint — silnik Futures 3x (v18.0) na pakiecie fut/
+#
+# Punkt wejścia: `python -m fut.main` (uruchamia pętlę async + Flask + health-check na "/").
+# Uwaga: zmienne oznaczone `sync: false` są tajne i trzeba je ustawić ręcznie
+# w dashboardzie Render (sekcja Environment danego serwisu).
+
+services:
+  - type: web
+    name: fut-engine
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m fut.main
+    healthCheckPath: /
+    envVars:
+      # --- tryb i waluta ---
+      - key: OKX_IS_SANDBOX
+        value: "False"
+      - key: QUOTE_CCY
+        value: USDC
+      - key: LOG_LEVEL
+        value: INFO
+      - key: OKX_API_URL
+        value: https://eea.okx.com
+
+      # --- TAJNE — ustaw ręcznie w dashboardzie (sync: false) ---
+      - key: OKX_API_KEY
+        sync: false
+      - key: OKX_SECRET_KEY
+        sync: false
+      - key: OKX_PASSPHRASE
+        sync: false
+      - key: EMERGENCY_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
