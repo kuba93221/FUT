@@ -69,8 +69,8 @@ FUTURES_INSTRUMENTS = [
         "base": "BTC",
         "label": "BTC_USD_XPERP",
         "price_round": 2,
-        "is_usd_ct": True,
-        "ct_val": 10.0
+        "is_usd_ct": False,  # FIXED: ctValCcy=BTC, use price*ctVal for nominal
+        "ct_val": 1.0         
     },
     {
         "symbol": "ETH-USD_UM_XPERP-310404" if not IS_SANDBOX else "ETH-USD_UM_XPERP-310328",
