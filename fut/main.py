@@ -43,25 +43,49 @@ def background_async_loop():
             state.ctx.smart_money_oracle = OKXSmartMoneyOracle(session, state.ctx.rate_limiter_public, is_sandbox=IS_SANDBOX)
             state.ctx.ws_feed = OKXWebSocketPriceFeed(session, is_sandbox=IS_SANDBOX)
 
-            logger.info("🌐 [STARTUP] Próba przejęcia roli MASTER...")
-            acquired = await state.ctx.redis_bridge.acquire_master_engine_lock(state.ctx.worker_id, ttl_seconds=60)
+            # --- Bootstrap z try/except: crash bootstrapu NIE zabija event loopa ---
+            # Bez tego: wyjątek z acquire_master_engine_lock lub master_bootstrap
+            # kończy run_until_complete → background_loop.is_running() == False →
+            # health check zwraca 503 → Render restartuje w nieskończoność.
+            try:
+                logger.info("🌐 [STARTUP] Próba przejęcia roli MASTER...")
+                acquired = await state.ctx.redis_bridge.acquire_master_engine_lock(state.ctx.worker_id, ttl_seconds=60)
 
-            if acquired:
-                state.ctx.is_master = True
-                logger.info(f"👑 [MASTER-ENGINE-NODE] Proces {state.ctx.worker_id} jest aktywnym MASTER.")
-                symbols = await master_bootstrap(state.ctx.redis_bridge, state.ctx.okx_client, session)
-                spawn_supervised_task(state.ctx.ws_feed.start_listener, "ws_price_feed", symbols, tg=state.ctx.tg)
-                spawn_supervised_task(master_lock_heartbeat_worker, "master_heartbeat_worker", state.ctx.redis_bridge, tg=state.ctx.tg)
-                spawn_supervised_task(protection_reconciler_worker, "reconciler_worker", state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client)
-                spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", session, state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client, state.ctx.smart_money_oracle, tg=state.ctx.tg)
-                if state.ctx.tg:
-                    await state.ctx.tg.push("👑 <b>[MASTER ENGINE ONLINE]</b> Silnik v18.0 (M15 CHoCH) wystartował pomyślnie. Kapitał bazowy zainicjalizowany.")
-            else:
-                state.ctx.is_master = False
-                logger.info(f"👀 [PASSIVE-NODE] Proces {state.ctx.worker_id} działa w trybie PASSIVE.")
-                configured_symbols = [item["symbol"] for item in FUTURES_INSTRUMENTS]
-                spawn_supervised_task(state.ctx.ws_feed.start_listener, "ws_price_feed", configured_symbols, tg=state.ctx.tg)
-                spawn_supervised_task(passive_leader_sentry_worker, "passive_sentry_worker", state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client, state.ctx.smart_money_oracle, tg=state.ctx.tg)
+                if acquired:
+                    state.ctx.is_master = True
+                    logger.info(f"👑 [MASTER-ENGINE-NODE] Proces {state.ctx.worker_id} jest aktywnym MASTER.")
+                    symbols = await master_bootstrap(state.ctx.redis_bridge, state.ctx.okx_client, session)
+                    spawn_supervised_task(state.ctx.ws_feed.start_listener, "ws_price_feed", symbols, tg=state.ctx.tg)
+                    spawn_supervised_task(master_lock_heartbeat_worker, "master_heartbeat_worker", state.ctx.redis_bridge, tg=state.ctx.tg)
+                    spawn_supervised_task(protection_reconciler_worker, "reconciler_worker", state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client)
+                    spawn_supervised_task(independent_4tf_sniper_worker, "sniper_4tf_worker", session, state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client, state.ctx.smart_money_oracle, tg=state.ctx.tg)
+                    if state.ctx.tg:
+                        await state.ctx.tg.push("👑 <b>[MASTER ENGINE ONLINE]</b> Silnik v18.0 (M15 CHoCH) wystartował pomyślnie. Kapitał bazowy zainicjalizowany.")
+                else:
+                    state.ctx.is_master = False
+                    logger.info(f"👀 [PASSIVE-NODE] Proces {state.ctx.worker_id} działa w trybie PASSIVE.")
+                    configured_symbols = [item["symbol"] for item in FUTURES_INSTRUMENTS]
+                    spawn_supervised_task(state.ctx.ws_feed.start_listener, "ws_price_feed", configured_symbols, tg=state.ctx.tg)
+                    spawn_supervised_task(passive_leader_sentry_worker, "passive_sentry_worker", state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client, state.ctx.smart_money_oracle, tg=state.ctx.tg)
+
+            except Exception as startup_exc:
+                # Logujemy błąd, ale NIE przerywamy pętli — Flask musi żyć.
+                # passive_leader_sentry spróbuje przejąć MASTER przy kolejnej próbie.
+                logger.critical(f"💥 [STARTUP-CRITICAL] Bootstrap nie powiódł się: {startup_exc}. "
+                                f"Flask aktywny — silnik zdegradowany. Sprawdź env vars i logi.")
+                try:
+                    if state.ctx.tg:
+                        await state.ctx.tg.push(f"💥 <b>[STARTUP CRITICAL]</b> Bootstrap silnika nie powiódł się: <code>{startup_exc}</code>\n"
+                                                 f"Flask ONLINE, handel WSTRZYMANY do ręcznej interwencji.")
+                except Exception:
+                    pass
+                # Uruchom passive sentry — może odzyska MASTER lock gdy Redis wróci
+                try:
+                    configured_symbols = [item["symbol"] for item in FUTURES_INSTRUMENTS]
+                    spawn_supervised_task(state.ctx.ws_feed.start_listener, "ws_price_feed", configured_symbols, tg=state.ctx.tg)
+                    spawn_supervised_task(passive_leader_sentry_worker, "passive_sentry_worker", state.ctx.redis_bridge, state.ctx.tg, state.ctx.okx_client, state.ctx.smart_money_oracle, tg=state.ctx.tg)
+                except Exception as spawn_exc:
+                    logger.error(f"❌ [STARTUP-DEGRADED] Nie można uruchomić passive sentry: {spawn_exc}")
 
             while not state.ctx.shutdown_event.is_set():
                 await asyncio.sleep(1)
